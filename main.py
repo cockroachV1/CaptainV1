@@ -327,53 +327,51 @@ _warning_85gb_sent = False
 
 async def load_bandwidth_state():
     """
-    Called on startup (after BOT_USERNAME is set).
     Loads this bot's bandwidth counter and Dead Mode state from MongoDB.
-
-    If this is a new bot (new username, never seen before), it creates a
-    fresh record and starts bandwidth_used at 0.
+    NEW LOGIC: Uses the Render STREAM_URL as the unique DB ID instead of BOT_USERNAME.
+    This ensures that deploying on a new Render URL automatically resets the counter to 0.
     """
     global _bandwidth_in_memory, IS_DEAD, _warning_85gb_sent
 
-    if not BOT_USERNAME:
-        LOGGER.error("[BANDWIDTH] BOT_USERNAME not set yet. Cannot load bandwidth state.")
+    if not Config.STREAM_URL:
+        LOGGER.error("[BANDWIDTH] STREAM_URL not set. Cannot load bandwidth state.")
         return
 
-    doc = await bandwidth_collection.find_one({"_id": BOT_USERNAME})
+    # Use STREAM_URL to find the document
+    doc = await bandwidth_collection.find_one({"_id": Config.STREAM_URL})
     if doc:
         _bandwidth_in_memory = doc.get("bandwidth_used", 0)
         IS_DEAD              = doc.get("is_dead", False)
         _warning_85gb_sent   = doc.get("warning_sent", False)
         LOGGER.info(
-            f"[BANDWIDTH] Loaded state for @{BOT_USERNAME}: "
+            f"[BANDWIDTH] Loaded state for URL {Config.STREAM_URL}: "
             f"Used={humanbytes(_bandwidth_in_memory)}, Dead={IS_DEAD}"
         )
     else:
-        # New bot — insert a fresh record
         _bandwidth_in_memory = 0
         IS_DEAD              = False
         _warning_85gb_sent   = False
         await bandwidth_collection.insert_one({
-            "_id":            BOT_USERNAME,
+            "_id":            Config.STREAM_URL, # Using URL as the unique key
+            "bot_username":   BOT_USERNAME,      # Kept for info purposes
             "bandwidth_used": 0,
             "is_dead":        False,
             "warning_sent":   False,
             "created_at":     datetime.utcnow()
         })
-        LOGGER.info(f"[BANDWIDTH] New bot @{BOT_USERNAME}: bandwidth counter starts at 0.")
-
+        LOGGER.info(f"[BANDWIDTH] New URL detected ({Config.STREAM_URL}) - counter starts at 0.")
 
 async def flush_bandwidth_to_db():
     """
-    Persists the current in-memory bandwidth counter to MongoDB.
-    Called automatically every 500 MB, and always on restart/shutdown
-    so no data is ever lost.
+    Persists the current in-memory bandwidth counter to MongoDB using STREAM_URL.
     """
-    if not BOT_USERNAME:
+    if not Config.STREAM_URL:
         return
+        
     await bandwidth_collection.update_one(
-        {"_id": BOT_USERNAME},
+        {"_id": Config.STREAM_URL}, # Update using URL as the key
         {"$set": {
+            "bot_username":   BOT_USERNAME,
             "bandwidth_used": _bandwidth_in_memory,
             "is_dead":        IS_DEAD,
             "warning_sent":   _warning_85gb_sent,
@@ -434,32 +432,24 @@ async def add_bandwidth(bytes_sent: int):
 
 async def trigger_dead_mode(reason: str = "auto"):
     """
-    Puts the bot into Dead Mode permanently.
-
-    - Sets IS_DEAD = True in memory immediately.
-      The stream_handler checks this flag at the TOP of every request,
-      so all new stream requests are rejected with 503 from this point on.
-    - Saves the Dead Mode state to MongoDB so it SURVIVES restarts.
-    - Sends a notification to all admins.
-
-    reason: "auto"   = hit the 90 GB threshold automatically
-            "manual" = admin pressed the Kill Bot button
+    Puts the bot into Dead Mode permanently using STREAM_URL as the ID.
     """
     global IS_DEAD
 
     if IS_DEAD:
-        return  # Already dead — don't run twice
+        return  # Already dead
 
     IS_DEAD = True
     LOGGER.critical(
-        f"[DEAD MODE] Bot @{BOT_USERNAME} is now DEAD. "
+        f"[DEAD MODE] URL {Config.STREAM_URL} is now DEAD. "
         f"Reason: {reason}. Bandwidth used: {humanbytes(_bandwidth_in_memory)}"
     )
 
-    # Save immediately to DB so the state persists across restarts
+    # Save immediately to DB using URL
     await bandwidth_collection.update_one(
-        {"_id": BOT_USERNAME},
+        {"_id": Config.STREAM_URL},
         {"$set": {
+            "bot_username":   BOT_USERNAME,
             "bandwidth_used": _bandwidth_in_memory,
             "is_dead":        True,
             "warning_sent":   _warning_85gb_sent,
@@ -473,17 +463,17 @@ async def trigger_dead_mode(reason: str = "auto"):
     try:
         reason_text = (
             "automatically (**90 GB** bandwidth limit reached)"
-            if reason == "auto"
-            else "**manually** by admin"
+            if reason == "auto" else "**manually** by admin"
         )
         for admin_id in Config.ADMIN_IDS:
             await main_bot.send_message(
                 admin_id,
                 f"🔴 **BOT IS NOW IN SLEEP (DEAD) MODE**\n\n"
                 f"**Bot:** @{BOT_USERNAME}\n"
+                f"**URL:** `{Config.STREAM_URL}`\n"
                 f"**Killed:** {reason_text}\n"
                 f"**Total bandwidth used:** `{humanbytes(_bandwidth_in_memory)}`\n\n"
-                f"The bot will **no longer serve any video streams.**\n"
+                f"The bot will no longer serve any video streams.\n"
                 f"Deploy a new bot on a new Render account to continue service."
             )
     except Exception as e:
