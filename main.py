@@ -1156,16 +1156,14 @@ async def stream_handler(request: web.Request):
 async def web_server():
     """
     Creates and configures the aiohttp web application.
-    V4.4: also sets up aiohttp_jinja2 with FileSystemLoader pointing to the
-    directory where player.html lives (same directory as this script by default).
-    Override TEMPLATES_DIR env var if player.html is in a different path.
+    Points aiohttp_jinja2 to the 'templates' folder.
     """
     web_app = web.Application(client_max_size=30_000_000)
 
-    # ── aiohttp_jinja2 setup (FEATURE 1) ─────────────────────────────────────
-    # Looks for player.html (and any other templates) in TEMPLATES_DIR.
-    # Default: the directory where main.py lives ('.').
-    templates_dir = os.environ.get("TEMPLATES_DIR", os.path.dirname(os.path.abspath(__file__)))
+    # ── aiohttp_jinja2 setup ─────────────────────────────────────
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    templates_dir = os.environ.get("TEMPLATES_DIR", os.path.join(base_dir, "templates"))
+    
     aiohttp_jinja2.setup(
         web_app,
         loader=jinja2.FileSystemLoader(templates_dir)
