@@ -5,6 +5,8 @@ tgcrypto
 # Asynchronous Web Server & HTTP Client
 aiohttp
 aiofiles
+aiohttp-jinja2
+jinja2
 
 # Asynchronous Database Driver
 motor
