@@ -985,7 +985,44 @@ async def stream_handler(request: web.Request):
                 content_type='text/plain'
             )
 
-        
+        # ── GATE 2: Referer Protection ────────────────────────────────────────
+        # In the new architecture, the player is hosted directly on the bot's /watch route.
+        # Therefore, the valid referer is the bot's OWN STREAM_URL.
+        referer         = request.headers.get('Referer', '')
+        allowed_referer = Config.STREAM_URL.rstrip('/')
+
+        if not referer or not referer.startswith(allowed_referer):
+            LOGGER.warning(
+                f"Blocked hotlink attempt. Referer='{referer}', Expected to start with='{allowed_referer}'"
+            )
+            return web.Response(
+                status=403,
+                text="403 Forbidden: Direct access is not allowed. Please use the official player."
+            )
+
+        # ── GATE 3: Token Verification (FEATURE 3) ────────────────────────────
+        # Every legitimate request from the player includes a fresh token injected
+        # by HLS.js xhrSetup. Download managers copying a URL get an expired token
+        # within 60 seconds and all subsequent requests are rejected.
+        token = request.rel_url.query.get('token', '')
+        if not token:
+            LOGGER.warning(
+                f"[STREAM] Missing token for msg_id="
+                f"{request.match_info.get('message_id', '?')}. Referer='{referer}'"
+            )
+            return web.Response(
+                status=403,
+                text="403 Forbidden: Missing stream token."
+            )
+        if not verify_stream_token(token):
+            LOGGER.warning(
+                f"[STREAM] Invalid/expired token for msg_id="
+                f"{request.match_info.get('message_id', '?')}. Referer='{referer}'"
+            )
+            return web.Response(
+                status=403,
+                text="403 Forbidden: Invalid or expired stream token."
+            )
 
         # ── Parse Request ─────────────────────────────────────────────────────
         message_id   = int(request.match_info['message_id'])
@@ -1633,12 +1670,3 @@ if __name__ == "__main__":
         if not loop.is_closed():
             loop.close()
         LOGGER.info("Shutdown complete. Goodbye!")
-        
-        
-        
-        
-        
-        
-        
-        
-        
