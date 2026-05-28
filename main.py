@@ -1050,6 +1050,40 @@ async def health_handler(request):
 async def favicon_handler(request):
     return web.Response(status=204)
 
+#══════════════════════════════════════════════════════════════════════════════
+  #main.py — ONLY ADDITION NEEDED (the rest of your V4.5 code is perfect)
+#══════════════════════════════════════════════════════════════════════════════
+
+@routes.get("/sw.js")
+async def sw_js_handler(request: web.Request):
+    """
+    Serves the Service Worker JavaScript file (sw.js) from the templates dir.
+
+    Required headers:
+      Content-Type: application/javascript   — browsers reject SW with wrong MIME
+      Service-Worker-Allowed: /              — allows the SW to control the root scope
+      Cache-Control: no-cache               — SW must never be served stale
+
+    The SW intercepts /secure-stream/<messageId> requests from the player and
+    rewrites them to /stream/<messageId>?token=<currentToken>, transparently
+    injecting the live rolling token into every byte-range request from the
+    <video> element — without ever touching videoPlayer.src.
+    """
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    sw_path  = os.path.join(base_dir, 'templates', 'sw.js')
+    try:
+        return web.FileResponse(
+            sw_path,
+            headers={
+                'Content-Type':           'application/javascript; charset=utf-8',
+                'Service-Worker-Allowed': '/',
+                'Cache-Control':          'no-cache, no-store, must-revalidate',
+                'Pragma':                 'no-cache',
+            }
+        )
+    except FileNotFoundError:
+        LOGGER.error(f"[SW] sw.js not found at: {sw_path}")
+        return web.Response(status=404, text='sw.js not found. Place it in the templates/ directory.')
 
 # ── FEATURE 1: /watch Route ───────────────────────────────────────────────────
 
