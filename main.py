@@ -1165,7 +1165,14 @@ async def stream_handler(request: web.Request):
     client_index     = None
     total_bytes_sent = 0
     ip_slot_acquired = False  # V4.5: tracks whether we incremented the IP counter
-    client_ip        = request.remote or "0.0.0.0"  # V4.5
+    
+    # [BUG FIX]: Get real IP if behind proxy (Render/Heroku/Cloudflare)
+    forwarded_for = request.headers.get("X-Forwarded-For")
+    if forwarded_for:
+        # Take the first IP in the list (the original client)
+        client_ip = forwarded_for.split(',')[0].strip()
+    else:
+        client_ip = request.remote or "0.0.0.0"
 
     try:
         # ── GATE 1: Dead Mode ─────────────────────────────────────────────────
