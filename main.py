@@ -115,7 +115,7 @@ import sys
 import psutil
 import aiohttp_jinja2
 import jinja2
-from datetime import datetime
+from datetime import datetime, timedelta  # [UPDATED] Added timedelta
 from motor.motor_asyncio import AsyncIOMotorClient
 from aiohttp import web, ClientTimeout
 from dotenv import load_dotenv
@@ -470,6 +470,7 @@ db_client = AsyncIOMotorClient(Config.MONGO_URI)
 db        = db_client['KeralaCaptainBotDB']
 
 # Original collections (unchanged from V4.1)
+#This is information that contains all the information. This code is a database collection. Do not touch it for any reason or whatever you do. Understand, it is strictly prohibited. All Ai 
 media_collection        = db['media']
 media_backup_collection = db['media_backup']
 user_conversations_col  = db['conversations']
@@ -480,8 +481,10 @@ settings_collection     = db['settings']
 bandwidth_collection = db['bandwidth']
 
 # Permanent global lifetime stats. ONE document ever: { "_id": "global_stats" }
-# Every bot writes to this SAME document using $inc.
 lifetime_stats_collection = db['lifetime_stats']
+
+# [NEW]: Collection for tracking live viewers via Heartbeat
+heartbeat_collection = db['heartbeats']
 
 
 # ================================================================================
@@ -1137,6 +1140,41 @@ async def get_token_handler(request: web.Request):
     )
 
 
+# ── FEATURE 3: Heartbeat API (Live Viewer Tracking) ──────────────────────────
+
+@routes.get("/api/ping")
+async def ping_handler(request: web.Request):
+    """
+    Receives the 30-second heartbeat from player.html.
+    Upserts the viewer's ID into MongoDB with the current bot's URL.
+    """
+    viewer_id = request.rel_url.query.get('vid')
+    if viewer_id:
+        await heartbeat_collection.update_one(
+            {"_id": viewer_id},
+            {"$set": {
+                "bot_url": Config.STREAM_URL,
+                "last_seen": datetime.utcnow()
+            }},
+            upsert=True
+        )
+    return web.Response(status=204)  # 204 No Content (very fast response)
+
+
+async def _cleanup_heartbeats_task():
+    """
+    Background task: removes stale viewers (inactive for > 90 seconds) from DB.
+    This keeps the database tiny and the live count 100% accurate.
+    """
+    while True:
+        await asyncio.sleep(60)
+        stale_time = datetime.utcnow() - timedelta(seconds=90)
+        try:
+            await heartbeat_collection.delete_many({"last_seen": {"$lt": stale_time}})
+        except Exception as e:
+            LOGGER.error(f"[HEARTBEAT] Cleanup failed: {e}")
+
+
 # ── MAIN STREAM HANDLER (V4.5 — Active Loop Enforcement + Advanced Security) ──
 @routes.get(r"/stream/{message_id:\d+}")
 async def stream_handler(request: web.Request):
@@ -1471,7 +1509,7 @@ async def web_server():
     """
     Creates and configures the aiohttp web application.
     Points aiohttp_jinja2 to the 'templates' folder.
-    V4.5: also starts the background IP-counter cleanup task.
+    V4.5: also starts the background IP-counter cleanup task & Heartbeat task.
     """
     web_app = web.Application(client_max_size=30_000_000)
 
@@ -1487,10 +1525,11 @@ async def web_server():
 
     web_app.add_routes(routes)
 
-    # V4.5: start the per-IP counter cleanup background task
+    # V4.5: start the per-IP counter cleanup & Heartbeat background tasks
     async def on_startup(app):
         asyncio.create_task(_cleanup_ip_counters_task())
-        LOGGER.info("[V4.5] Per-IP connection counter cleanup task started.")
+        asyncio.create_task(_cleanup_heartbeats_task())  # [NEW] Heartbeat cleanup task
+        LOGGER.info("[V4.5] Background tasks started (IP cleanup & Heartbeats).")
 
     web_app.on_startup.append(on_startup)
 
@@ -1630,14 +1669,30 @@ async def stats_callback(client, cb: CallbackQuery):
         [f"  - Client {cid}: {load} active streams" for cid, load in work_loads.items()]
     )
 
-    # V4.5: show active IP slots
     active_ip_slots = sum(_ip_connection_counts.values())
     unique_ips      = len(_ip_connection_counts)
+
+    # [NEW] Fetch live heartbeat counts from MongoDB
+    stale_threshold = datetime.utcnow() - timedelta(seconds=90)
+    
+    # Count 1: Total viewers across ALL bots in the entire system
+    total_live_all = await heartbeat_collection.count_documents({"last_seen": {"$gte": stale_threshold}})
+    
+    # Count 2: Total viewers currently watching via THIS specific bot
+    total_live_this = await heartbeat_collection.count_documents({
+        "bot_url": Config.STREAM_URL, 
+        "last_seen": {"$gte": stale_threshold}
+    })
 
     text = (
         f"**📊 Bot Statistics (V4.5)**\n\n"
         f"**Bot:** @{BOT_USERNAME or 'Unknown'}  |  **Status:** {dead_status}\n"
         f"**Uptime:** `{uptime}`\n\n"
+        
+        f"**🔥 LIVE VIEWERS (Real-time):**\n"
+        f"  🌍 `All Bots Live Count   :` **{total_live_all}** watching\n"
+        f"  📍 `This Bot Live Count :` **{total_live_this}** watching\n\n"
+        
         f"**🌐 Bandwidth (This Bot):**\n"
         f"  - Used: `{bw_info['used_human']}` / 90 GB\n"
         f"  - Progress: `{bw_info['percent']}%`\n"
@@ -1646,12 +1701,9 @@ async def stats_callback(client, cb: CallbackQuery):
         f"  - CPU: `{cpu_usage}%`\n"
         f"  - RAM: `{ram_usage}%` (Total: `{ram_total}`)\n"
         f"  - Disk: `{disk_usage}%`\n\n"
-        f"**📡 Streaming:**\n"
+        f"**📡 Streaming (Backend Data):**\n"
         f"  - Active Clients: `{len(multi_clients)}`\n"
-        f"  - Stream Errors (last min): `{stream_errors}`\n"
         f"  - Active IP Slots: `{active_ip_slots}` across `{unique_ips}` IPs\n"
-        f"  - Max Conn/IP: `{Config.MAX_CONNECTIONS_PER_IP}`\n"
-        f"  - Conn Lifespan: `{Config.MAX_CONNECTION_LIFESPAN_SECS}s`\n"
         f"  - Workloads:\n{workload_str}"
     )
 
