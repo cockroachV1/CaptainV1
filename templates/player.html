@@ -436,6 +436,22 @@
     document.addEventListener('DOMContentLoaded', function () {
         'use strict';
 
+        // ── [NEW] HEARTBEAT SYSTEM ───────────────────────────────────────────
+        // Generate a unique viewer ID for this browser session and save it
+        var viewerId = localStorage.getItem('kc_viewer_id');
+        if (!viewerId) {
+            viewerId = 'v_' + Math.random().toString(36).substr(2, 9) + '_' + Date.now();
+            localStorage.setItem('kc_viewer_id', viewerId);
+        }
+
+        // Send a silent ping to the server every 30 seconds
+        function sendHeartbeat() {
+            fetch('/api/ping?vid=' + viewerId).catch(function(e) { /* Silent fail */ });
+        }
+        sendHeartbeat(); // Send immediately on load
+        setInterval(sendHeartbeat, 30000); // Repeat every 30s
+        // ─────────────────────────────────────────────────────────────────────
+
         // ── DOM refs ─────────────────────────────────────────────────────────
         var videoPlayer     = document.getElementById('video-player');
         var skeletonLoader  = document.getElementById('skeleton-loader');
