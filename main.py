@@ -1,105 +1,8 @@
 # ================================================================================
-# KeralaCaptain Bot - Pure Streaming Engine V4.5
+# KeralaCaptain Bot — Pure Streaming Engine V4.5
 # ================================================================================
-#
-#   NEW IN V4.5 — ACTIVE LOOP ENFORCEMENT + ADVANCED ANTI-DOWNLOADER SECURITY
-#
-# ┌─────────────────────────────────────────────────────────────────────────────┐
-# │  THE CRITICAL FLAW FIXED (V4.4 → V4.5)                                     │
-# │                                                                             │
-# │  In V4.4, the 60-second HMAC token was verified ONLY at Gate 3 (the route  │
-# │  handler). Because we stream a continuous MP4 (not HLS chunks), a download  │
-# │  manager could send ONE valid request, pass Gate 3, and then hold the open  │
-# │  HTTP connection indefinitely while the async for chunk loop fed it the     │
-# │  entire file — hours after the token technically expired.                   │
-# │                                                                             │
-# │  FIX: Connection Lifespan Enforcement (inside the stream loop)              │
-# │  Inside the async for chunk... loop, a hard ceiling of                      │
-# │  MAX_CONNECTION_LIFESPAN_SECS (default 50 s) is enforced. When exceeded,   │
-# │  the server forcefully breaks the loop and closes the response.             │
-# │                                                                             │
-# │  WHY THIS IS SEAMLESS FOR REAL USERS:                                       │
-# │  player.html already has an 'error' event listener on the video element.    │
-# │  When the server force-drops, the browser fires error code 2                │
-# │  (MEDIA_ERR_NETWORK). The frontend silently fetches a fresh token via       │
-# │  /api/get_token, sets a new video.src, and issues a Range request to        │
-# │  resume at exactly the current playback position. Real viewers see zero     │
-# │  buffering. Download managers fail because their stale token has expired    │
-# │  (60 s TTL) before they can reconnect, and they have no mechanism to mint   │
-# │  a new one (they lack a valid, live browser session with valid Referer).    │
-# └─────────────────────────────────────────────────────────────────────────────┘
-#
-#   GATE ORDER IN V4.5 stream_handler:
-#   ─────────────────────────────────
-#   Gate 1  — Dead Mode check              → 503
-#   Gate 2a — User-Agent fingerprinting    → 403  [NEW V4.5]
-#   Gate 2b — HTTP header integrity check  → 403  [NEW V4.5]
-#   Gate 3  — Referer protection           → 403  (unchanged)
-#   Gate 4  — HMAC token verification      → 403  (unchanged)
-#   Gate 5  — Per-IP concurrent limit      → 429  [NEW V4.5]
-#   Gate 6  — Connection Lifespan (loop)   → force break  [NEW V4.5 — THE FIX]
-#
-#   ADVANCED DYNAMIC THROTTLE (V4.5 enhancements):
-#   ───────────────────────────────────────────────
-#   Phase 1 — Burst (first BURST_DURATION_SECS):   full speed, no delay.
-#              Browser buffer fills instantly; real users never stall.
-#   Phase 2 — Throttle (after burst):              asyncio.sleep with ±jitter.
-#              Sustained rate ≈ 1.5–2 MB/s. Plenty for 1080p playback;
-#              makes bulk downloading agonisingly slow.
-#   Phase 3 — Escalation (after DATA_ESCALATION_MB sent per connection):
-#              Sleep increases to DATA_ESCALATION_SLEEP_SECS (default 1.5 s).
-#              The more a DM tries to grab, the slower each chunk arrives.
-#
-#   NEW GATE 2a — User-Agent Fingerprinting:
-#   ─────────────────────────────────────────
-#   Matches against a frozenset of known download-manager UA substrings
-#   (1DM, IDM, wget, aria2, curl, JDownloader, Xunlei, python-requests, etc.).
-#   Also blocks requests with empty/missing UA — real browsers ALWAYS send one.
-#
-#   NEW GATE 2b — HTTP Header Integrity Check:
-#   ───────────────────────────────────────────
-#   Real browsers unconditionally send Accept-Language and Accept-Encoding.
-#   Many download managers strip non-essential headers or send raw HTTP/1.0.
-#   Requests missing BOTH of these headers are rejected with 403.
-#
-#   NEW GATE 5 — Per-IP Concurrent Connection Limit:
-#   ─────────────────────────────────────────────────
-#   Legitimate viewers stream one video at a time (1–2 connections max).
-#   Download managers open 4–16 parallel connections to maximise throughput.
-#   Exceeding MAX_CONNECTIONS_PER_IP (default 4) returns 429 Too Many Requests.
-#   The counter is maintained in a lightweight in-memory dict and is always
-#   decremented in the finally block, even on exception or forced drop.
-#
-#   COMPLETELY UNCHANGED FROM V4.4:
-#   ─────────────────────────────────
-#   • All bandwidth tracking & auto-kill (85 GB warning, 90 GB kill).
-#   • MongoDB collections, flush logic, and lifetime stats.
-#   • ByteStreamer class, yield_file(), FileReferenceExpired refresh logic.
-#   • Multi-client load balancing, admin panel, restart/kill handlers.
-#   • chunk_size = 1024 * 1024 (1 MB) — Pyrogram offset math untouched.
-#   • /watch, /api/get_token, /health, /favicon.ico routes.
-#   • Token generation and verify_stream_token() — no changes.
-#
-#   TIMING COORDINATION (why 50 s is the right lifespan):
-#   ───────────────────────────────────────────────────────
-#   Token TTL              = 60 s
-#   Frontend refresh rate  = every 45 s  (15 s grace window)
-#   MAX_CONNECTION_LIFESPAN= 50 s
-#
-#   Real user flow: connection starts → burst fills buffer → throttle begins →
-#   at t=45 s frontend proactively swaps to a fresh token (seamless) →
-#   server force-drops at t=50 s → frontend error handler fires → new Range
-#   request with already-refreshed token → zero visible disruption.
-#
-#   DM flow: connection starts → throttled to ~1.5 MB/s → force-drop at t=50 s
-#   (~75–100 MB grabbed) → DM reconnects with stale token → token expires at
-#   t=60 s → 403. DM must somehow get a new token (requires live browser
-#   session + Referer + all header checks). Effectively broken.
-#
-#   NEW DEPENDENCIES (no changes from V4.4 — random is stdlib):
-#     pip install aiohttp-jinja2 jinja2
-#
-# ================================================================================
+
+# ── SECTION 1: IMPORTS & LOGGING ─────────────────────────────────────────────
 
 import os
 import time
@@ -115,7 +18,7 @@ import sys
 import psutil
 import aiohttp_jinja2
 import jinja2
-from datetime import datetime, timedelta  # [UPDATED] Added timedelta
+from datetime import datetime, timedelta
 from motor.motor_asyncio import AsyncIOMotorClient
 from aiohttp import web, ClientTimeout
 from dotenv import load_dotenv
@@ -130,10 +33,8 @@ from pyrogram.file_id import FileId, FileType
 from pyrogram import raw
 from pyrogram.raw.types import InputPhotoFileLocation, InputDocumentFileLocation
 
-# Load .env file
 load_dotenv()
 
-# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format='[%(asctime)s - %(levelname)s] - %(message)s'
@@ -142,13 +43,10 @@ LOGGER = logging.getLogger(__name__)
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
 logging.getLogger("aiohttp.web").setLevel(logging.ERROR)
 
-# Bot process start time (used for uptime display)
 start_time = time.time()
 
 
-# ================================================================================
-# CONFIGURATION
-# ================================================================================
+# ── SECTION 2: CONFIGURATION ──────────────────────────────────────────────────
 
 class Config:
     API_ID           = int(os.environ.get("API_ID", 0))
@@ -163,48 +61,32 @@ class Config:
     PING_INTERVAL    = int(os.environ.get("PING_INTERVAL", 1200))
     ON_HEROKU        = 'DYNO' in os.environ
 
-    # ── Bandwidth Thresholds ──────────────────────────────────────────────────
-    BANDWIDTH_WARNING_BYTES = 85 * 1024 * 1024 * 1024   # Send admin warning at 85 GB
-    BANDWIDTH_KILL_BYTES    = 90 * 1024 * 1024 * 1024   # Auto-kill at 90 GB
+    # ── Bandwidth Thresholds (fallback defaults only) ─────────────────────────
+    # These are used ONLY when no DB config exists AND DEFAULT_LIMIT_MODE=True.
+    BANDWIDTH_WARNING_BYTES = 85 * 1024 * 1024 * 1024   # 85 GB
+    BANDWIDTH_KILL_BYTES    = 90 * 1024 * 1024 * 1024   # 90 GB
     BANDWIDTH_FLUSH_EVERY   = 500 * 1024 * 1024          # Flush to DB every 500 MB
 
+    # ── [NEW] VPS-Ready Default Limit Mode ────────────────────────────────────
+    # True  = limit is ON by default (Render/Heroku free-plan mode).
+    # False = limit is OFF by default (VPS with unlimited bandwidth).
+    # Set DEFAULT_LIMIT_MODE=false in .env when moving to VPS.
+    DEFAULT_LIMIT_MODE = os.environ.get("DEFAULT_LIMIT_MODE", "true").lower() == "true"
+
     # ── Streaming Throttle ────────────────────────────────────────────────────
-    # Burst: full speed for the first N seconds of every new connection/seek.
     BURST_DURATION_SECS      = 10
-
-    # Throttle: sleep injected between chunks after the burst phase ends.
-    # At 1 MB/chunk + 0.5 s sleep → ~2 MB/s sustained. Fine for 1080p;
-    # fatal for bulk download.
     THROTTLE_SLEEP_SECS      = 0.5
-
-    # Jitter: random ±N seconds added to each throttle sleep.
-    # Prevents download managers from timing the fixed pause interval.
     THROTTLE_JITTER_SECS     = 0.15
-
-    # Escalation: after this many MB sent in one connection, sleep increases.
-    # Makes large-file downloading progressively more painful.
-    DATA_ESCALATION_MB       = 80           # Escalate after 80 MB per connection
-    DATA_ESCALATION_SLEEP    = 1.5          # Escalated sleep in seconds
+    DATA_ESCALATION_MB       = 80
+    DATA_ESCALATION_SLEEP    = 1.5
 
     # ── V4.5 Connection Lifespan (THE MAIN FIX) ──────────────────────────────
-    # Hard ceiling for how long a single HTTP streaming connection may live.
-    # After this many seconds the server forcefully breaks the chunk loop and
-    # closes the response. The frontend's error handler seamlessly recovers.
-    #
-    # 50 s is chosen because:
-    #   • Token TTL = 60 s  →  stale token has < 10 s left after the drop
-    #   • Frontend proactive refresh = every 45 s  →  most user connections
-    #     swap voluntarily before the server enforces the drop
     MAX_CONNECTION_LIFESPAN_SECS = 50
 
     # ── V4.5 Per-IP Concurrent Connection Limit ───────────────────────────────
-    # Real viewers: 1 stream at a time.
-    # Download managers: 4–16 parallel connections for maximum throughput.
-    # Connections beyond this limit receive 429 Too Many Requests immediately.
     MAX_CONNECTIONS_PER_IP = 4
 
 
-# ── Validate required env vars ────────────────────────────────────────────────
 required_vars = [
     Config.API_ID, Config.API_HASH, Config.BOT_TOKEN,
     Config.MONGO_URI, Config.LOG_CHANNEL_ID, Config.STREAM_URL,
@@ -217,13 +99,10 @@ if not all(required_vars) or Config.ADMIN_IDS == [0]:
     )
     exit(1)
 
-# Global dynamic protected domain (loaded from DB at startup; changeable by admin)
 CURRENT_PROTECTED_DOMAIN = Config.PROTECTED_DOMAIN
 
 
-# ================================================================================
-# HELPER FUNCTIONS
-# ================================================================================
+# ── SECTION 3: HELPER FUNCTIONS ───────────────────────────────────────────────
 
 async def encode(string: str) -> str:
     """Base64-encodes a string for use in stream URLs."""
@@ -272,26 +151,15 @@ def get_readable_time(seconds: int) -> str:
     return result
 
 
-# ================================================================================
-# TOKEN SYSTEM — HMAC-SHA256, 60-second validity (UNCHANGED FROM V4.4)
-# ================================================================================
+# ── SECTION 4: TOKEN SYSTEM — HMAC-SHA256, 60-second validity ────────────────
 # Token format (after base64url decoding): "<video_id>:<unix_timestamp>:<hmac_hex>"
-# Secret key = BOT_TOKEN (never sent to clients).
-#
-# Security properties:
-#   - Stateless: no DB lookup needed to verify — pure crypto.
-#   - Tamper-proof: any bit-flip in video_id or timestamp invalidates the HMAC.
-#   - Time-limited: tokens older than TOKEN_MAX_AGE_SECS return 403.
-#   - V4.5 Connection Lifespan ensures even a valid token cannot stream forever.
+# Secret key = BOT_TOKEN (never sent to clients). Completely unchanged from V4.4.
 
-TOKEN_MAX_AGE_SECS = 60  # Hard expiry — matches the 45-second refresh interval in player.html
+TOKEN_MAX_AGE_SECS = 60
 
 
 def generate_stream_token(video_id: str) -> str:
-    """
-    Generates a fresh HMAC-SHA256 token for video_id, valid for TOKEN_MAX_AGE_SECS.
-    Called by /api/get_token.
-    """
+    """Generates a fresh HMAC-SHA256 token for video_id, valid for TOKEN_MAX_AGE_SECS."""
     timestamp = int(time.time())
     message   = f"{video_id}:{timestamp}"
     sig       = hmac.new(
@@ -304,70 +172,49 @@ def generate_stream_token(video_id: str) -> str:
 
 
 def verify_stream_token(token: str) -> bool:
-    """
-    Verifies a token:
-      1. Decodes base64url.
-      2. Splits into (video_id, timestamp, sig).
-      3. Recomputes expected HMAC and compares using constant-time compare_digest.
-      4. Checks that the token is no older than TOKEN_MAX_AGE_SECS.
-
-    Returns True only if ALL checks pass.
-    """
+    """Verifies HMAC, timestamp freshness. Returns True only if ALL checks pass."""
     try:
         padded  = token + "=" * (-len(token) % 4)
         decoded = base64.urlsafe_b64decode(padded.encode()).decode()
-
-        # rsplit with maxsplit=2 handles video_ids that might contain ':'
         parts = decoded.rsplit(":", 2)
         if len(parts) != 3:
             return False
-
         video_id, timestamp_str, received_sig = parts
-
         message      = f"{video_id}:{timestamp_str}"
         expected_sig = hmac.new(
             Config.BOT_TOKEN.encode(),
             message.encode(),
             hashlib.sha256
         ).hexdigest()
-
         if not hmac.compare_digest(expected_sig, received_sig):
             return False
-
         token_age = time.time() - int(timestamp_str)
         if token_age > TOKEN_MAX_AGE_SECS or token_age < 0:
             return False
-
         return True
-
     except Exception:
         return False
 
 
-# ================================================================================
-# V4.5 SECURITY HELPERS — UA FINGERPRINTING & HEADER INTEGRITY
-# ================================================================================
+# ── SECTION 5: V4.5 SECURITY HELPERS ─────────────────────────────────────────
 
-# Lowercase substrings found in the User-Agent strings of known download managers,
-# bulk-download tools, automation frameworks, and non-browser HTTP clients.
-# frozenset for O(1) membership checks.
 _BLOCKED_UA_FRAGMENTS: frozenset = frozenset([
     # Dedicated download managers
-    "1dm",                       # 1DM (Android)
-    "idm/",                      # Internet Download Manager
+    "1dm",
+    "idm/",
     "internet download manager",
-    "fdm",                       # Free Download Manager
+    "fdm",
     "free download manager",
-    "jdownloader",               # JDownloader
-    "getright",                  # GetRight
-    "flashget",                  # FlashGet
-    "xunlei",                    # Xunlei (Thunder)
+    "jdownloader",
+    "getright",
+    "flashget",
+    "xunlei",
     "thunder/",
     "bitcomet",
     "bittorrent",
     "utorrent",
-    "aria2",                     # aria2 (CLI downloader)
-    "axel",                      # Axel
+    "aria2",
+    "axel",
     # Generic HTTP tools (not browsers)
     "wget/",
     "curl/",
@@ -378,16 +225,16 @@ _BLOCKED_UA_FRAGMENTS: frozenset = frozenset([
     "python-requests",
     "python-urllib",
     "python/",
-    "java/",                     # Java HttpURLConnection / Apache HttpClient
+    "java/",
     "apachehttpclient",
     "apache-httpclient",
-    "go-http-client",            # Go net/http
+    "go-http-client",
     "ruby",
     "perl/",
     # Android automation / download
     "dalvik/",
-    "okhttp/",                   # OkHttp (used by many download apps)
-    "downloadmanager",           # Android DownloadManager API
+    "okhttp/",
+    "downloadmanager",
     "android download",
     "uiautomator",
     # Bots & scrapers
@@ -402,57 +249,29 @@ _BLOCKED_UA_FRAGMENTS: frozenset = frozenset([
     "playwright",
 ])
 
-# UA substrings that look like bots but appear in real browser UAs too —
-# don't add overly broad terms that would block legitimate users.
 
 def _is_download_manager_ua(ua: str) -> bool:
-    """
-    Returns True if the User-Agent string belongs to a known download manager
-    or non-browser HTTP client.
-
-    Empty/missing UA is also flagged — every real browser sends a UA string.
-    """
+    """Returns True if the UA belongs to a known DM or non-browser HTTP client."""
     if not ua or not ua.strip():
-        return True  # No UA = almost certainly not a real browser
+        return True
     ua_lower = ua.lower()
     return any(fragment in ua_lower for fragment in _BLOCKED_UA_FRAGMENTS)
 
 
 def _passes_header_integrity_check(request: web.Request) -> bool:
-    """
-    Validates that the request carries headers consistent with a real browser.
-
-    Real browsers unconditionally send both Accept-Language (OS/locale) and
-    Accept-Encoding (HTTP stack negotiation). Download managers that construct
-    raw HTTP requests often omit one or both.
-
-    We require at least one of these to be present.  Requiring both would
-    occasionally false-positive on some embedded WebViews; requiring at least
-    one catches the vast majority of stripped-down DM requests.
-    """
+    """Validates that the request carries headers consistent with a real browser."""
     has_accept_encoding = bool(request.headers.get("Accept-Encoding", "").strip())
     has_accept_language = bool(request.headers.get("Accept-Language", "").strip())
     return has_accept_encoding or has_accept_language
 
 
-# ================================================================================
-# V4.5 PER-IP CONCURRENT CONNECTION TRACKING
-# ================================================================================
-# Lightweight in-memory dict.  No DB needed — counters reset on restart which
-# is acceptable (a restart forces all active streams to reconnect anyway).
-# The dict is updated atomically because aiohttp runs in a single-threaded
-# asyncio event loop — no lock required for correctness, but we keep the
-# logic explicit for clarity.
+# ── SECTION 6: V4.5 PER-IP CONNECTION TRACKING ───────────────────────────────
 
-_ip_connection_counts: dict = {}   # { "ip_string": active_stream_count }
+_ip_connection_counts: dict = {}
 
 
 async def _cleanup_ip_counters_task():
-    """
-    Background task: removes zero/negative entries from _ip_connection_counts
-    every 5 minutes.  Defensive guard against any edge case that leaves a
-    stale entry even though the finally block should always clean up correctly.
-    """
+    """Background task: removes stale zero-count entries from _ip_connection_counts."""
     while True:
         await asyncio.sleep(300)
         stale_ips = [ip for ip, count in list(_ip_connection_counts.items()) if count <= 0]
@@ -462,34 +281,31 @@ async def _cleanup_ip_counters_task():
             LOGGER.debug(f"[CLEANUP] Removed {len(stale_ips)} stale IP counter entries.")
 
 
-# ================================================================================
-# DATABASE SETUP
-# ================================================================================
+# ── SECTION 7: DATABASE SETUP ─────────────────────────────────────────────────
 
 db_client = AsyncIOMotorClient(Config.MONGO_URI)
 db        = db_client['KeralaCaptainBotDB']
 
-# Original collections (unchanged from V4.1)
-#This is information that contains all the information. This code is a database collection. Do not touch it for any reason or whatever you do. Understand, it is strictly prohibited. All Ai 
+# Original collections — STRICTLY DO NOT MODIFY OR REMOVE
 media_collection        = db['media']
 media_backup_collection = db['media_backup']
 user_conversations_col  = db['conversations']
 settings_collection     = db['settings']
 
-# Per-bot bandwidth tracking.
-# Documents: { "_id": "STREAM_URL", "bandwidth_used": int, "is_dead": bool, ... }
-bandwidth_collection = db['bandwidth']
+# Per-bot bandwidth tracking
+bandwidth_collection    = db['bandwidth']
 
 # Permanent global lifetime stats. ONE document ever: { "_id": "global_stats" }
 lifetime_stats_collection = db['lifetime_stats']
 
-# [NEW]: Collection for tracking live viewers via Heartbeat
-heartbeat_collection = db['heartbeats']
+# Live viewer tracking via heartbeat
+heartbeat_collection    = db['heartbeats']
+
+# [NEW] Dynamic bandwidth limit configuration (global & per-bot)
+bw_limits_collection    = db['bw_limits']
 
 
-# ================================================================================
-# ORIGINAL DATABASE FUNCTIONS (unchanged from V4.1)
-# ================================================================================
+# ── SECTION 8: DATABASE FUNCTIONS ─────────────────────────────────────────────
 
 async def check_duplicate(tmdb_id):
     """Checks for duplicates only in the main collection."""
@@ -581,9 +397,11 @@ async def set_protected_domain(new_domain: str) -> str:
     return new_domain
 
 
-# ================================================================================
-# BANDWIDTH TRACKING & AUTO-KILL (Dead Mode) — UNCHANGED FROM V4.4
-# ================================================================================
+# ── SECTION 9: BANDWIDTH TRACKING & DEAD MODE ────────────────────────────────
+# Core bandwidth accounting. Unchanged from V4.4 except:
+#  • Lifetime stats increment BEFORE the IS_DEAD check (Golden Rule 2 fix).
+#  • Warning & kill thresholds now use the dynamic in-memory limit cache
+#    (_effective_limit_enabled / _effective_limit_bytes) set in Section 10.
 
 BOT_USERNAME = ""
 
@@ -596,8 +414,7 @@ _warning_85gb_sent     = False
 async def load_bandwidth_state():
     """
     Loads this bot's bandwidth counter and Dead Mode state from MongoDB.
-    Uses the Render STREAM_URL as the unique DB ID.
-    A new Render URL automatically resets the counter to 0.
+    Uses the STREAM_URL as the unique DB ID. Also loads the effective limit.
     """
     global _bandwidth_in_memory, IS_DEAD, _warning_85gb_sent
 
@@ -628,12 +445,14 @@ async def load_bandwidth_state():
         })
         LOGGER.info(f"[BANDWIDTH] New URL detected ({Config.STREAM_URL}) - counter starts at 0.")
 
+    # Load effective dynamic limit on startup
+    await refresh_effective_limit()
+
 
 async def flush_bandwidth_to_db():
     """Persists the current in-memory bandwidth counter to MongoDB using STREAM_URL."""
     if not Config.STREAM_URL:
         return
-
     await bandwidth_collection.update_one(
         {"_id": Config.STREAM_URL},
         {"$set": {
@@ -649,11 +468,15 @@ async def flush_bandwidth_to_db():
 
 async def add_bandwidth(bytes_sent: int):
     """
-    Adds bytes_sent to the in-memory counter and checks kill thresholds.
+    Adds bytes_sent to the in-memory counter and checks dynamic kill thresholds.
     Called from inside the stream_handler loop so even partial streams are counted.
-    Also increments the permanent lifetime global stats counter.
+
+    GOLDEN RULE: Lifetime stats ALWAYS increment, even when IS_DEAD is True.
     """
     global _bandwidth_in_memory, _bandwidth_since_flush, IS_DEAD, _warning_85gb_sent
+
+    # Lifetime stats increment UNCONDITIONALLY (regardless of dead/limit state)
+    asyncio.create_task(_increment_lifetime_bandwidth_db(bytes_sent))
 
     if IS_DEAD:
         return
@@ -661,38 +484,41 @@ async def add_bandwidth(bytes_sent: int):
     _bandwidth_in_memory   += bytes_sent
     _bandwidth_since_flush += bytes_sent
 
-    asyncio.create_task(_increment_lifetime_bandwidth_db(bytes_sent))
-
     if _bandwidth_since_flush >= Config.BANDWIDTH_FLUSH_EVERY:
         _bandwidth_since_flush = 0
         await flush_bandwidth_to_db()
         LOGGER.info(f"[BANDWIDTH] Flushed to DB. Total used: {humanbytes(_bandwidth_in_memory)}")
 
-    # ── 85 GB Warning ────────────────────────────────────────────────────────
-    if not _warning_85gb_sent and _bandwidth_in_memory >= Config.BANDWIDTH_WARNING_BYTES:
-        _warning_85gb_sent = True
-        await flush_bandwidth_to_db()
-        LOGGER.warning(f"[BANDWIDTH] WARNING threshold reached: {humanbytes(_bandwidth_in_memory)}")
-        try:
-            for admin_id in Config.ADMIN_IDS:
-                await main_bot.send_message(
-                    admin_id,
-                    f"⚠️ **BANDWIDTH WARNING!**\n\n"
-                    f"**Bot:** @{BOT_USERNAME}\n"
-                    f"**Used:** `{humanbytes(_bandwidth_in_memory)}`\n\n"
-                    f"You are approaching the **90 GB auto-kill limit.**\n"
-                    f"Please **prepare to deploy a new bot** on a new Render account soon!"
-                )
-        except Exception as e:
-            LOGGER.error(f"Could not send bandwidth warning to admin: {e}")
+    # ── Dynamic Warning & Kill Checks ─────────────────────────────────────────
+    # Uses the in-memory cache updated by refresh_effective_limit() every 60 s.
+    # If the limit is disabled (unlimited mode), neither warning nor kill fires.
+    if _effective_limit_enabled:
+        # Warning fires 5 GB before the kill limit (scales with whatever limit is set)
+        warning_threshold = max(0, _effective_limit_bytes - (5 * 1024 * 1024 * 1024))
+        if not _warning_85gb_sent and _bandwidth_in_memory >= warning_threshold:
+            _warning_85gb_sent = True
+            await flush_bandwidth_to_db()
+            LOGGER.warning(f"[BANDWIDTH] WARNING threshold reached: {humanbytes(_bandwidth_in_memory)}")
+            try:
+                for admin_id in Config.ADMIN_IDS:
+                    await main_bot.send_message(
+                        admin_id,
+                        f"⚠️ **BANDWIDTH WARNING!**\n\n"
+                        f"**Bot:** @{BOT_USERNAME}\n"
+                        f"**Used:** `{humanbytes(_bandwidth_in_memory)}`\n\n"
+                        f"Approaching the **{humanbytes(_effective_limit_bytes)} auto-kill limit.**\n\n"
+                        f"👉 Go to **Admin Panel → 🚦 Bandwidth Limits** to increase the "
+                        f"limit or turn it OFF before the bot goes to sleep!"
+                    )
+            except Exception as e:
+                LOGGER.error(f"Could not send bandwidth warning to admin: {e}")
 
-    # ── 90 GB Auto-Kill ──────────────────────────────────────────────────────
-    if _bandwidth_in_memory >= Config.BANDWIDTH_KILL_BYTES:
-        await trigger_dead_mode(reason="auto")
+        if _bandwidth_in_memory >= _effective_limit_bytes:
+            await trigger_dead_mode(reason="auto")
 
 
 async def trigger_dead_mode(reason: str = "auto"):
-    """Puts the bot into Dead Mode permanently using STREAM_URL as the ID."""
+    """Puts the bot into Dead Mode. Can be revived instantly via admin panel."""
     global IS_DEAD
 
     if IS_DEAD:
@@ -718,8 +544,9 @@ async def trigger_dead_mode(reason: str = "auto"):
     )
 
     try:
+        limit_str   = humanbytes(_effective_limit_bytes) if _effective_limit_enabled else "N/A"
         reason_text = (
-            "automatically (**90 GB** bandwidth limit reached)"
+            f"automatically (**{limit_str}** bandwidth limit reached)"
             if reason == "auto" else "**manually** by admin"
         )
         for admin_id in Config.ADMIN_IDS:
@@ -730,8 +557,10 @@ async def trigger_dead_mode(reason: str = "auto"):
                 f"**URL:** `{Config.STREAM_URL}`\n"
                 f"**Killed:** {reason_text}\n"
                 f"**Total bandwidth used:** `{humanbytes(_bandwidth_in_memory)}`\n\n"
-                f"The bot will no longer serve any video streams.\n"
-                f"Deploy a new bot on a new Render account to continue service."
+                f"The bot will no longer serve any video streams.\n\n"
+                f"**✨ To Revive Without Restart:**\n"
+                f"Go to **Admin Panel → 🚦 Bandwidth Limits** and either increase "
+                f"this bot's limit or turn it OFF. The bot wakes up instantly!"
             )
     except Exception as e:
         LOGGER.error(f"Could not send Dead Mode notification: {e}")
@@ -739,23 +568,194 @@ async def trigger_dead_mode(reason: str = "auto"):
 
 def get_bandwidth_info() -> dict:
     """Returns a snapshot of current bandwidth info. Used by admin panel and /health."""
+    kill_threshold = _effective_limit_bytes if _effective_limit_enabled else 0
+    percent = (
+        round((_bandwidth_in_memory / kill_threshold) * 100, 2)
+        if (kill_threshold > 0 and _effective_limit_enabled) else 0.0
+    )
     return {
-        "used":              _bandwidth_in_memory,
-        "used_human":        humanbytes(_bandwidth_in_memory),
-        "is_dead":           IS_DEAD,
-        "warning_sent":      _warning_85gb_sent,
-        "kill_threshold":    Config.BANDWIDTH_KILL_BYTES,
-        "warning_threshold": Config.BANDWIDTH_WARNING_BYTES,
-        "percent":           round((_bandwidth_in_memory / Config.BANDWIDTH_KILL_BYTES) * 100, 2)
+        "used":                 _bandwidth_in_memory,
+        "used_human":           humanbytes(_bandwidth_in_memory),
+        "is_dead":              IS_DEAD,
+        "warning_sent":         _warning_85gb_sent,
+        "limit_enabled":        _effective_limit_enabled,
+        "kill_threshold":       kill_threshold,
+        "kill_threshold_human": humanbytes(kill_threshold) if kill_threshold > 0 else "Unlimited",
+        "warning_threshold":    max(0, kill_threshold - 5 * 1024 * 1024 * 1024) if _effective_limit_enabled else 0,
+        "percent":              percent
     }
 
 
-# ================================================================================
-# LIFETIME GLOBAL STATISTICS (UNCHANGED FROM V4.4)
-# ================================================================================
+# ── SECTION 10: DYNAMIC BANDWIDTH LIMIT SYSTEM ───────────────────────────────
+#
+#  DB Schema (bw_limits_collection):
+#    Global:   { "_id": "global",               "enabled": bool, "limit_bytes": int }
+#    Specific: { "_id": "specific:<stream_url>", "enabled": bool, "limit_bytes": int }
+#
+#  Override Priority: Specific > Global > Config.DEFAULT_LIMIT_MODE fallback
+#
+#  In-memory cache (refreshed every 60 s by _bw_limit_checker_task):
+#    _effective_limit_enabled  — whether the limit is active for this bot
+#    _effective_limit_bytes    — the active kill threshold in bytes
+#
+#  Auto-Revive: if IS_DEAD and admin increases/disables the limit via the panel,
+#  _bw_limit_checker_task detects the change within 60 s and wakes the bot
+#  up instantly — no restart required.
+
+_effective_limit_enabled: bool = True
+_effective_limit_bytes:   int  = Config.BANDWIDTH_KILL_BYTES
+
+
+async def get_global_bw_config() -> dict | None:
+    """Returns the global BW limit document from DB, or None if never set."""
+    return await bw_limits_collection.find_one({"_id": "global"})
+
+
+async def get_specific_bw_config(stream_url: str) -> dict | None:
+    """Returns the per-bot BW limit document from DB, or None if never set."""
+    return await bw_limits_collection.find_one({"_id": f"specific:{stream_url}"})
+
+
+async def set_global_bw_config(enabled: bool, limit_bytes: int):
+    """Saves / updates the global BW limit config in MongoDB."""
+    await bw_limits_collection.update_one(
+        {"_id": "global"},
+        {"$set": {"enabled": enabled, "limit_bytes": limit_bytes, "updated_at": datetime.utcnow()}},
+        upsert=True
+    )
+    LOGGER.info(
+        f"[BW LIMITS] Global config saved: enabled={enabled}, "
+        f"limit={humanbytes(limit_bytes) if enabled else 'Unlimited'}"
+    )
+
+
+async def set_specific_bw_config(stream_url: str, enabled: bool, limit_bytes: int):
+    """Saves / updates a per-bot BW limit config in MongoDB."""
+    await bw_limits_collection.update_one(
+        {"_id": f"specific:{stream_url}"},
+        {"$set": {
+            "enabled":    enabled,
+            "limit_bytes": limit_bytes,
+            "stream_url": stream_url,
+            "updated_at": datetime.utcnow()
+        }},
+        upsert=True
+    )
+    LOGGER.info(
+        f"[BW LIMITS] Specific config saved for {stream_url}: enabled={enabled}, "
+        f"limit={humanbytes(limit_bytes) if enabled else 'Unlimited'}"
+    )
+
+
+async def delete_specific_bw_config(stream_url: str):
+    """Removes a per-bot specific BW config (bot reverts to global rule)."""
+    await bw_limits_collection.delete_one({"_id": f"specific:{stream_url}"})
+    LOGGER.info(f"[BW LIMITS] Specific config removed for {stream_url}. Reverts to global.")
+
+
+async def get_effective_bw_config(stream_url: str) -> tuple:
+    """
+    Returns (limit_enabled: bool, limit_bytes: int) for the given stream_url.
+    Specific rule overrides Global. Falls back to Config.DEFAULT_LIMIT_MODE if no DB doc.
+    """
+    # 1. Check specific rule first
+    specific = await get_specific_bw_config(stream_url)
+    if specific is not None:
+        return specific.get("enabled", True), specific.get("limit_bytes", Config.BANDWIDTH_KILL_BYTES)
+
+    # 2. Check global rule
+    global_cfg = await get_global_bw_config()
+    if global_cfg is not None:
+        return global_cfg.get("enabled", True), global_cfg.get("limit_bytes", Config.BANDWIDTH_KILL_BYTES)
+
+    # 3. No DB config — fall back to DEFAULT_LIMIT_MODE
+    if Config.DEFAULT_LIMIT_MODE:
+        return True, Config.BANDWIDTH_KILL_BYTES
+    else:
+        return False, 0  # Unlimited (VPS mode)
+
+
+async def refresh_effective_limit():
+    """
+    Fetches current effective BW limit from MongoDB and updates the in-memory cache.
+    Also performs Auto-Revive: if IS_DEAD and the new effective limit allows streaming,
+    sets IS_DEAD = False and notifies the admin — NO restart required.
+    """
+    global _effective_limit_enabled, _effective_limit_bytes, IS_DEAD, _warning_85gb_sent
+
+    try:
+        enabled, limit_bytes = await get_effective_bw_config(Config.STREAM_URL)
+        # Safety: if enabled but limit_bytes is 0 or negative, use the Config default
+        if enabled and limit_bytes <= 0:
+            limit_bytes = Config.BANDWIDTH_KILL_BYTES
+
+        prev_enabled = _effective_limit_enabled
+        prev_bytes   = _effective_limit_bytes
+
+        _effective_limit_enabled = enabled
+        _effective_limit_bytes   = limit_bytes if limit_bytes > 0 else Config.BANDWIDTH_KILL_BYTES
+
+        if (prev_enabled != enabled) or (prev_bytes != _effective_limit_bytes):
+            limit_str = "Unlimited" if not enabled else humanbytes(_effective_limit_bytes)
+            LOGGER.info(f"[BW LIMITS] Effective limit updated: {limit_str}")
+
+        # ── Auto-Revive Logic ─────────────────────────────────────────────────
+        # Revive if: limit is turned OFF, or limit is ON but higher than current usage.
+        if IS_DEAD:
+            should_revive = (not enabled) or (enabled and limit_bytes > _bandwidth_in_memory)
+            if should_revive:
+                IS_DEAD            = False
+                _warning_85gb_sent = False  # Reset warning so it fires again near new threshold
+                await bandwidth_collection.update_one(
+                    {"_id": Config.STREAM_URL},
+                    {"$set": {
+                        "is_dead":      False,
+                        "warning_sent": False,
+                        "last_updated": datetime.utcnow()
+                    }},
+                    upsert=True
+                )
+                limit_str = "Unlimited" if not enabled else humanbytes(limit_bytes)
+                LOGGER.info(
+                    f"[AUTO-REVIVE] Bot revived! New effective limit: {limit_str}. "
+                    f"Current usage: {humanbytes(_bandwidth_in_memory)}"
+                )
+                try:
+                    for admin_id in Config.ADMIN_IDS:
+                        await main_bot.send_message(
+                            admin_id,
+                            f"🟢 **BOT AUTO-REVIVED!**\n\n"
+                            f"**Bot:** @{BOT_USERNAME}\n"
+                            f"**New Effective Limit:** `{limit_str}`\n"
+                            f"**Current Usage:** `{humanbytes(_bandwidth_in_memory)}`\n\n"
+                            f"The bot is **active and serving streams** again. ✅\n"
+                            f"No restart was required!"
+                        )
+                except Exception as e:
+                    LOGGER.error(f"[AUTO-REVIVE] Could not send notification: {e}")
+
+    except Exception as e:
+        LOGGER.error(f"[BW LIMITS] Error in refresh_effective_limit: {e}")
+
+
+async def _bw_limit_checker_task():
+    """
+    Background task: polls MongoDB every 60 s for updated BW limit settings.
+    This is what makes Admin Panel changes take effect on all running bots
+    without a restart, and what triggers instant Auto-Revive.
+    """
+    while True:
+        await asyncio.sleep(60)
+        try:
+            await refresh_effective_limit()
+        except Exception as e:
+            LOGGER.error(f"[BW LIMIT CHECKER] Unexpected error: {e}")
+
+
+# ── SECTION 11: LIFETIME GLOBAL STATISTICS ───────────────────────────────────
 
 async def _increment_lifetime_bandwidth_db(bytes_sent: int):
-    """Increments the permanent shared lifetime bandwidth counter."""
+    """Increments the permanent shared lifetime bandwidth counter. Always called."""
     try:
         await lifetime_stats_collection.update_one(
             {"_id": "global_stats"},
@@ -787,16 +787,11 @@ async def get_lifetime_stats() -> dict:
             "total_bandwidth_human": humanbytes(doc.get("total_bandwidth_bytes", 0)),
             "total_streams":         doc.get("total_streams", 0)
         }
-    return {
-        "total_bandwidth_bytes": 0,
-        "total_bandwidth_human": "0 B",
-        "total_streams":         0
-    }
+    return {"total_bandwidth_bytes": 0, "total_bandwidth_human": "0 B", "total_streams": 0}
 
 
-# ================================================================================
-# STREAMING ENGINE — ByteStreamer CLASS (COMPLETELY UNCHANGED FROM V4.1)
-# ================================================================================
+# ── SECTION 12: STREAMING ENGINE — ByteStreamer CLASS ─────────────────────────
+# COMPLETELY UNCHANGED FROM V4.1. DO NOT MODIFY ANYTHING IN THIS SECTION.
 
 multi_clients          = {}
 work_loads             = {}
@@ -1002,9 +997,7 @@ class ByteStreamer:
                 continue
 
 
-# ================================================================================
-# WEB ROUTES
-# ================================================================================
+# ── SECTION 13: WEB ROUTES ────────────────────────────────────────────────────
 
 routes = web.RouteTableDef()
 
@@ -1032,7 +1025,6 @@ async def health_handler(request):
         if sample_client in class_cache:
             cache_size = len(class_cache[sample_client].cached_file_ids)
 
-    # V4.5: include active IP connection counts in health response (admin visibility)
     active_ip_slots = sum(_ip_connection_counts.values())
 
     return web.json_response({
@@ -1042,10 +1034,12 @@ async def health_handler(request):
         "stream_errors_last_min":    stream_errors,
         "workloads":                 work_loads,
         "bandwidth_used":            bw_info["used_human"],
+        "bandwidth_limit":           bw_info["kill_threshold_human"],
         "bandwidth_percent":         f"{bw_info['percent']}%",
-        "active_ip_stream_slots":    active_ip_slots,   # V4.5
-        "max_conn_per_ip":           Config.MAX_CONNECTIONS_PER_IP,  # V4.5
-        "max_connection_lifespan_s": Config.MAX_CONNECTION_LIFESPAN_SECS,  # V4.5
+        "limit_enabled":             bw_info["limit_enabled"],
+        "active_ip_stream_slots":    active_ip_slots,
+        "max_conn_per_ip":           Config.MAX_CONNECTIONS_PER_IP,
+        "max_connection_lifespan_s": Config.MAX_CONNECTION_LIFESPAN_SECS,
     })
 
 
@@ -1053,24 +1047,12 @@ async def health_handler(request):
 async def favicon_handler(request):
     return web.Response(status=204)
 
-#══════════════════════════════════════════════════════════════════════════════
-  #main.py — ONLY ADDITION NEEDED (the rest of your V4.5 code is perfect)
-#══════════════════════════════════════════════════════════════════════════════
 
 @routes.get("/sw.js")
 async def sw_js_handler(request: web.Request):
     """
     Serves the Service Worker JavaScript file (sw.js) from the templates dir.
-
-    Required headers:
-      Content-Type: application/javascript   — browsers reject SW with wrong MIME
-      Service-Worker-Allowed: /              — allows the SW to control the root scope
-      Cache-Control: no-cache               — SW must never be served stale
-
-    The SW intercepts /secure-stream/<messageId> requests from the player and
-    rewrites them to /stream/<messageId>?token=<currentToken>, transparently
-    injecting the live rolling token into every byte-range request from the
-    <video> element — without ever touching videoPlayer.src.
+    Required headers: correct MIME type, Service-Worker-Allowed scope, no-cache.
     """
     base_dir = os.path.dirname(os.path.abspath(__file__))
     sw_path  = os.path.join(base_dir, 'templates', 'sw.js')
@@ -1088,49 +1070,30 @@ async def sw_js_handler(request: web.Request):
         LOGGER.error(f"[SW] sw.js not found at: {sw_path}")
         return web.Response(status=404, text='sw.js not found. Place it in the templates/ directory.')
 
-# ── FEATURE 1: /watch Route ───────────────────────────────────────────────────
 
 @routes.get("/watch")
 async def watch_handler(request: web.Request):
-    """
-    Renders and serves player.html.
-    Captures ALL query parameters (id, view_id, s, e, etc.) and passes them to the template.
-    """
+    """Renders and serves player.html. Passes all query params to the template."""
     query_params = dict(request.rel_url.query)
-
     if 'id' not in query_params and 'view_id' not in query_params:
-        return web.Response(
-            status=400,
-            text="400 Bad Request: Missing video ID parameter."
-        )
+        return web.Response(status=400, text="400 Bad Request: Missing video ID parameter.")
+    return aiohttp_jinja2.render_template('player.html', request, context={'query': query_params})
 
-    return aiohttp_jinja2.render_template(
-        'player.html',
-        request,
-        context={'query': query_params}
-    )
-
-
-# ── FEATURE 2: Token API ──────────────────────────────────────────────────────
 
 @routes.get("/api/get_token")
 async def get_token_handler(request: web.Request):
     """
     GET /api/get_token?video_id=<id>
     Returns a fresh HMAC token valid for 60 seconds.
-    The player.html JS calls this every 45 seconds and after any forced drop.
     """
     video_id = request.rel_url.query.get('video_id', 'unknown')
-
     if IS_DEAD:
         return web.json_response(
             {"error": "Service unavailable: bandwidth limit reached."},
             status=503
         )
-
     token = generate_stream_token(video_id)
     LOGGER.debug(f"[TOKEN] Issued token for video_id={video_id}")
-
     return web.json_response(
         {"token": token, "expires_in": TOKEN_MAX_AGE_SECS},
         headers={
@@ -1140,32 +1103,24 @@ async def get_token_handler(request: web.Request):
     )
 
 
-# ── FEATURE 3: Heartbeat API (Live Viewer Tracking) ──────────────────────────
-
 @routes.get("/api/ping")
 async def ping_handler(request: web.Request):
-    """
-    Receives the 30-second heartbeat from player.html.
-    Upserts the viewer's ID into MongoDB with the current bot's URL.
-    """
+    """Receives the 30-second heartbeat from player.html for live viewer tracking."""
     viewer_id = request.rel_url.query.get('vid')
     if viewer_id:
         await heartbeat_collection.update_one(
             {"_id": viewer_id},
             {"$set": {
-                "bot_url": Config.STREAM_URL,
+                "bot_url":   Config.STREAM_URL,
                 "last_seen": datetime.utcnow()
             }},
             upsert=True
         )
-    return web.Response(status=204)  # 204 No Content (very fast response)
+    return web.Response(status=204)
 
 
 async def _cleanup_heartbeats_task():
-    """
-    Background task: removes stale viewers (inactive for > 90 seconds) from DB.
-    This keeps the database tiny and the live count 100% accurate.
-    """
+    """Background task: removes stale viewers (inactive > 90 s) from DB."""
     while True:
         await asyncio.sleep(60)
         stale_time = datetime.utcnow() - timedelta(seconds=90)
@@ -1176,6 +1131,7 @@ async def _cleanup_heartbeats_task():
 
 
 # ── MAIN STREAM HANDLER (V4.5 — Active Loop Enforcement + Advanced Security) ──
+
 @routes.get(r"/stream/{message_id:\d+}")
 async def stream_handler(request: web.Request):
     """
@@ -1183,31 +1139,21 @@ async def stream_handler(request: web.Request):
 
     GATE ORDER:
       1. Dead Mode check             → 503                    (unchanged)
-      2a. User-Agent fingerprinting  → 403  [NEW V4.5]
-      2b. Header integrity check     → 403  [NEW V4.5]
+      2a. User-Agent fingerprinting  → 403  [V4.5]
+      2b. Header integrity check     → 403  [V4.5]
       3. Referer protection          → 403                    (unchanged)
       4. Token verification          → 403                    (unchanged)
-      5. Per-IP concurrent limit     → 429  [NEW V4.5]
-      6. Connection Lifespan (loop)  → force break            [THE MAIN FIX V4.5]
-
-    Inside-loop security (V4.5):
-      • Connection Lifespan Enforcement: break at MAX_CONNECTION_LIFESPAN_SECS.
-        Frontend error handler catches the drop and seamlessly resumes.
-      • Burst → Throttle → Escalation: dynamic sleep with random jitter.
-
-    All V4.4 logic (load balancing, bandwidth tracking, FileReferenceExpired
-    refresh, partial-stream counting, seek handling) is completely unchanged.
+      5. Per-IP concurrent limit     → 429  [V4.5]
+      6. Connection Lifespan (loop)  → force break            [V4.5 THE MAIN FIX]
     """
     global stream_errors
 
     client_index     = None
     total_bytes_sent = 0
-    ip_slot_acquired = False  # V4.5: tracks whether we incremented the IP counter
-    
-    # [BUG FIX]: Get real IP if behind proxy (Render/Heroku/Cloudflare)
+    ip_slot_acquired = False
+
     forwarded_for = request.headers.get("X-Forwarded-For")
     if forwarded_for:
-        # Take the first IP in the list (the original client)
         client_ip = forwarded_for.split(',')[0].strip()
     else:
         client_ip = request.remote or "0.0.0.0"
@@ -1225,39 +1171,26 @@ async def stream_handler(request: web.Request):
                 content_type='text/plain'
             )
 
-        # ── GATE 2a (V4.5): User-Agent Fingerprinting ────────────────────────
-        # Block known download managers and headless/automation clients.
-        # Empty UA is also blocked — every real browser sends a User-Agent string.
+        # ── GATE 2a: User-Agent Fingerprinting ───────────────────────────────
         user_agent = request.headers.get('User-Agent', '')
         if _is_download_manager_ua(user_agent):
             LOGGER.warning(
                 f"[STREAM V4.5] Blocked UA fingerprint. "
                 f"UA='{user_agent[:100]}' IP={client_ip}"
             )
-            return web.Response(
-                status=403,
-                text="403 Forbidden: Access denied."
-            )
+            return web.Response(status=403, text="403 Forbidden: Access denied.")
 
-        # ── GATE 2b (V4.5): HTTP Header Integrity Check ───────────────────────
-        # Require at least Accept-Language or Accept-Encoding.
-        # Real browsers always send one or both. Many DMs strip these headers.
+        # ── GATE 2b: HTTP Header Integrity Check ──────────────────────────────
         if not _passes_header_integrity_check(request):
             LOGGER.warning(
                 f"[STREAM V4.5] Blocked: missing browser-specific headers. "
                 f"IP={client_ip} UA='{user_agent[:80]}'"
             )
-            return web.Response(
-                status=403,
-                text="403 Forbidden: Access denied."
-            )
+            return web.Response(status=403, text="403 Forbidden: Access denied.")
 
         # ── GATE 3: Referer Protection ────────────────────────────────────────
-        # The player is hosted on the bot's own /watch route, so the valid
-        # Referer is the bot's own STREAM_URL.
         referer         = request.headers.get('Referer', '')
         allowed_referer = Config.STREAM_URL.rstrip('/')
-
         if not referer or not referer.startswith(allowed_referer):
             LOGGER.warning(
                 f"[STREAM] Blocked hotlink. Referer='{referer}' "
@@ -1269,35 +1202,21 @@ async def stream_handler(request: web.Request):
             )
 
         # ── GATE 4: Token Verification ────────────────────────────────────────
-        # Every legitimate request from the player includes a fresh token.
-        # Token is stateless HMAC-SHA256, verified without any DB lookup.
         token = request.rel_url.query.get('token', '')
         if not token:
             LOGGER.warning(
                 f"[STREAM] Missing token for msg_id="
                 f"{request.match_info.get('message_id', '?')} IP={client_ip}"
             )
-            return web.Response(
-                status=403,
-                text="403 Forbidden: Missing stream token."
-            )
+            return web.Response(status=403, text="403 Forbidden: Missing stream token.")
         if not verify_stream_token(token):
             LOGGER.warning(
                 f"[STREAM] Invalid/expired token for msg_id="
                 f"{request.match_info.get('message_id', '?')} IP={client_ip}"
             )
-            return web.Response(
-                status=403,
-                text="403 Forbidden: Invalid or expired stream token."
-            )
+            return web.Response(status=403, text="403 Forbidden: Invalid or expired stream token.")
 
-        # ── GATE 5 (V4.5): Per-IP Concurrent Connection Limit ─────────────────
-        # Increment BEFORE the streaming begins. Decremented in finally block
-        # so it is always released, even on exceptions or forced drops.
-        #
-        # Legitimate viewers: 1–2 connections (one stream + one seek range).
-        # Download managers: 4–16 parallel connections for speed.
-        # Exceeding MAX_CONNECTIONS_PER_IP → 429.
+        # ── GATE 5: Per-IP Concurrent Connection Limit ────────────────────────
         _ip_connection_counts[client_ip] = _ip_connection_counts.get(client_ip, 0) + 1
         if _ip_connection_counts[client_ip] > Config.MAX_CONNECTIONS_PER_IP:
             _ip_connection_counts[client_ip] -= 1
@@ -1312,7 +1231,7 @@ async def stream_handler(request: web.Request):
                     "Please close other streams and try again."
                 )
             )
-        ip_slot_acquired = True  # Mark: must decrement in finally
+        ip_slot_acquired = True
 
         # ── Parse Request ─────────────────────────────────────────────────────
         message_id   = int(request.match_info['message_id'])
@@ -1373,40 +1292,13 @@ async def stream_handler(request: web.Request):
             asyncio.create_task(increment_lifetime_streams())
 
         # ── Connection Lifespan & Burst Timer ────────────────────────────────
-        # Every new Range request (including seeks) starts its own burst clock
-        # AND its own lifespan clock. This means:
-        #   - Initial play:       10 s full speed → throttle → server drops at 50 s
-        #   - User seeks forward: 10 s full speed → throttle → server drops at 50 s
-        #   - Download manager:   throttled, escalated, then hard-dropped at 50 s
         connection_start_time = time.time()
+        is_first_chunk        = True
 
         # ── Direct Pipe: Telegram → User ─────────────────────────────────────
-        # If the user closes the player, resp.write() throws ConnectionError or
-        # CancelledError — we break immediately.
-        # Bandwidth is tracked PER CHUNK so even a partial watch is counted.
-        is_first_chunk = True
-
         async for chunk in tg_connect.yield_file(file_id, offset, chunk_size, message_id):
             try:
-                # ── GATE 6 (V4.5): Connection Lifespan Enforcement ────────────
-                #
-                # This is THE MAIN FIX for V4.5.
-                #
-                # Once elapsed >= MAX_CONNECTION_LIFESPAN_SECS, we forcefully
-                # break the loop. The server closes the response mid-stream.
-                # The browser fires 'error' code 2 (MEDIA_ERR_NETWORK).
-                # The player.html error handler calls silentTokenRefresh():
-                #   1. Fetches a fresh token from /api/get_token
-                #   2. Saves currentTime
-                #   3. Sets new video.src with new token embedded
-                #   4. Seeks to savedTime (browser issues Range request)
-                #   5. Resumes playback — viewer sees nothing
-                #
-                # A download manager cannot do step 1 above: it has no live
-                # browser session to call /api/get_token from, and its old URL
-                # has an expired token (only ~10 s of TTL remain after a 50 s
-                # connection). The reconnect attempt gets 403 Forbidden.
-                #
+                # ── GATE 6: Connection Lifespan Enforcement ───────────────────
                 elapsed = time.time() - connection_start_time
                 if elapsed >= Config.MAX_CONNECTION_LIFESPAN_SECS:
                     LOGGER.info(
@@ -1415,7 +1307,7 @@ async def stream_handler(request: web.Request):
                         f"for msg_id={message_id}, sent={humanbytes(total_bytes_sent)}, "
                         f"IP={client_ip}"
                     )
-                    break  # Server-side force close. Frontend recovers seamlessly.
+                    break
 
                 # ── Write chunk ───────────────────────────────────────────────
                 if is_first_chunk and first_part_cut > 0:
@@ -1428,29 +1320,12 @@ async def stream_handler(request: web.Request):
                     total_bytes_sent += len(chunk)
 
                 # ── Bandwidth tracking ────────────────────────────────────────
-                # Track bandwidth on every chunk so partial streams count too.
-                # add_bandwidth() handles the 500 MB flush cadence internally.
                 await add_bandwidth(
                     len(chunk) if not (is_first_chunk and first_part_cut > 0)
                     else len(chunk) - first_part_cut
                 )
 
-                # ── Advanced Dynamic Throttle (V4.5 enhanced) ─────────────────
-                #
-                # Phase 1 — BURST (elapsed <= BURST_DURATION_SECS):
-                #   No sleep. Full speed. Browser buffer fills instantly.
-                #   After a Range seek, this burst restarts — no user stutter.
-                #
-                # Phase 2 — THROTTLE (elapsed > BURST_DURATION_SECS):
-                #   sleep = THROTTLE_SLEEP_SECS ± random jitter
-                #   Sustained rate ≈ 1.5–2 MB/s. Enough for 1080p playback.
-                #   Jitter prevents DMs from timing around a fixed pause.
-                #
-                # Phase 3 — ESCALATION (total_bytes_sent > DATA_ESCALATION_MB):
-                #   sleep increases to DATA_ESCALATION_SLEEP — effectively
-                #   halving the sustained rate. The more a DM tries to grab
-                #   in a single connection, the slower each chunk comes.
-                #
+                # ── Advanced Dynamic Throttle (Phase 1 Burst / 2 Throttle / 3 Escalation) ──
                 if elapsed > Config.BURST_DURATION_SECS:
                     escalation_threshold = Config.DATA_ESCALATION_MB * 1024 * 1024
                     if total_bytes_sent >= escalation_threshold:
@@ -1466,8 +1341,6 @@ async def stream_handler(request: web.Request):
                     await asyncio.sleep(sleep_time)
 
             except (ConnectionError, asyncio.CancelledError):
-                # User disconnected (closed player, changed quality, etc.)
-                # Stop immediately — do NOT continue fetching from Telegram.
                 LOGGER.debug(
                     f"[STREAM] Client disconnected for msg_id={message_id} "
                     f"after {humanbytes(total_bytes_sent)} sent. IP={client_ip}"
@@ -1489,9 +1362,6 @@ async def stream_handler(request: web.Request):
         return web.Response(status=500)
 
     finally:
-        # ── Always release all acquired resources ─────────────────────────────
-
-        # V4.5: decrement per-IP counter only if we actually incremented it
         if ip_slot_acquired:
             _ip_connection_counts[client_ip] = max(
                 0, _ip_connection_counts.get(client_ip, 0) - 1
@@ -1499,7 +1369,6 @@ async def stream_handler(request: web.Request):
             if _ip_connection_counts.get(client_ip, 0) == 0:
                 _ip_connection_counts.pop(client_ip, None)
 
-        # Decrement workload counter for the selected Pyrogram client
         if client_index is not None:
             work_loads[client_index] -= 1
             LOGGER.debug(f"[STREAM] Workload decremented for client {client_index}.")
@@ -1508,37 +1377,29 @@ async def stream_handler(request: web.Request):
 async def web_server():
     """
     Creates and configures the aiohttp web application.
-    Points aiohttp_jinja2 to the 'templates' folder.
-    V4.5: also starts the background IP-counter cleanup task & Heartbeat task.
+    V4.5: starts IP-counter cleanup, Heartbeat, and BW-limit-checker background tasks.
     """
     web_app = web.Application(client_max_size=30_000_000)
 
-    # ── aiohttp_jinja2 setup ──────────────────────────────────────────────────
     base_dir      = os.path.dirname(os.path.abspath(__file__))
     templates_dir = os.environ.get("TEMPLATES_DIR", os.path.join(base_dir, "templates"))
 
-    aiohttp_jinja2.setup(
-        web_app,
-        loader=jinja2.FileSystemLoader(templates_dir)
-    )
+    aiohttp_jinja2.setup(web_app, loader=jinja2.FileSystemLoader(templates_dir))
     LOGGER.info(f"[WEB] Jinja2 templates directory: {templates_dir}")
 
     web_app.add_routes(routes)
 
-    # V4.5: start the per-IP counter cleanup & Heartbeat background tasks
     async def on_startup(app):
         asyncio.create_task(_cleanup_ip_counters_task())
-        asyncio.create_task(_cleanup_heartbeats_task())  # [NEW] Heartbeat cleanup task
-        LOGGER.info("[V4.5] Background tasks started (IP cleanup & Heartbeats).")
+        asyncio.create_task(_cleanup_heartbeats_task())
+        asyncio.create_task(_bw_limit_checker_task())   # [NEW] Dynamic BW limit checker
+        LOGGER.info("[STARTUP] Background tasks started: IP cleanup, Heartbeats, BW Limit Checker.")
 
     web_app.on_startup.append(on_startup)
-
     return web_app
 
 
-# ================================================================================
-# BOT & CLIENT INITIALIZATION
-# ================================================================================
+# ── SECTION 14: BOT & CLIENT INITIALIZATION ───────────────────────────────────
 
 main_bot = Client(
     "KeralaCaptainBot",
@@ -1590,26 +1451,17 @@ async def initialize_clients():
     multi_clients.update({cid: client for cid, client in results if client is not None})
 
     if len(multi_clients) > 1:
-        LOGGER.info(
-            f"Multi-Client mode ON: {len(multi_clients)} clients initialised."
-        )
+        LOGGER.info(f"Multi-Client mode ON: {len(multi_clients)} clients initialised.")
 
 
 async def forward_file_safely(message_to_forward: Message):
-    """
-    Resends a Telegram file via the main bot to refresh its file_reference.
-    Called by yield_file() when FileReferenceExpired is raised.
-    Completely unchanged from V4.1.
-    """
+    """Resends a Telegram file via the main bot to refresh its file_reference."""
     try:
         media = message_to_forward.document or message_to_forward.video
         if not media:
             LOGGER.error("forward_file_safely: message has no media.")
             return None
-
-        LOGGER.info(
-            f"Sending cached media for msg {message_to_forward.id} via main bot..."
-        )
+        LOGGER.info(f"Sending cached media for msg {message_to_forward.id} via main bot...")
         return await main_bot.send_cached_media(
             chat_id=Config.LOG_CHANNEL_ID,
             file_id=media.file_id,
@@ -1620,9 +1472,7 @@ async def forward_file_safely(message_to_forward: Message):
         return None
 
 
-# ================================================================================
-# ADMIN BOT HANDLERS
-# ================================================================================
+# ── SECTION 15: ADMIN BOT HANDLERS ───────────────────────────────────────────
 
 admin_only = filters.user(Config.ADMIN_IDS)
 
@@ -1630,11 +1480,12 @@ admin_only = filters.user(Config.ADMIN_IDS)
 def _get_main_menu_markup() -> InlineKeyboardMarkup:
     """Returns the main admin panel inline keyboard."""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Statistics",       callback_data="admin_stats")],
-        [InlineKeyboardButton("📈 Lifetime Stats",   callback_data="admin_lifetime_stats")],
-        [InlineKeyboardButton("⚙️ Settings",         callback_data="admin_settings")],
-        [InlineKeyboardButton("🔄 Restart Bot",      callback_data="admin_restart")],
-        [InlineKeyboardButton("🛑 Kill Bot (Sleep)", callback_data="admin_kill_bot")],
+        [InlineKeyboardButton("📊 Statistics",        callback_data="admin_stats")],
+        [InlineKeyboardButton("📈 Lifetime Stats",    callback_data="admin_lifetime_stats")],
+        [InlineKeyboardButton("🚦 Bandwidth Limits",  callback_data="admin_bw_limits")],
+        [InlineKeyboardButton("⚙️ Settings",          callback_data="admin_settings")],
+        [InlineKeyboardButton("🔄 Restart Bot",       callback_data="admin_restart")],
+        [InlineKeyboardButton("🛑 Kill Bot (Sleep)",  callback_data="admin_kill_bot")],
     ])
 
 
@@ -1646,6 +1497,8 @@ async def start_command(client, message: Message):
     )
     await update_user_conversation(message.chat.id, None)
 
+
+# ── Statistics ────────────────────────────────────────────────────────────────
 
 @main_bot.on_callback_query(filters.regex("^admin_stats$") & admin_only)
 async def stats_callback(client, cb: CallbackQuery):
@@ -1672,31 +1525,28 @@ async def stats_callback(client, cb: CallbackQuery):
     active_ip_slots = sum(_ip_connection_counts.values())
     unique_ips      = len(_ip_connection_counts)
 
-    # [NEW] Fetch live heartbeat counts from MongoDB
-    stale_threshold = datetime.utcnow() - timedelta(seconds=90)
-    
-    # Count 1: Total viewers across ALL bots in the entire system
-    total_live_all = await heartbeat_collection.count_documents({"last_seen": {"$gte": stale_threshold}})
-    
-    # Count 2: Total viewers currently watching via THIS specific bot
-    total_live_this = await heartbeat_collection.count_documents({
-        "bot_url": Config.STREAM_URL, 
-        "last_seen": {"$gte": stale_threshold}
+    stale_threshold  = datetime.utcnow() - timedelta(seconds=90)
+    total_live_all   = await heartbeat_collection.count_documents({"last_seen": {"$gte": stale_threshold}})
+    total_live_this  = await heartbeat_collection.count_documents({
+        "bot_url": Config.STREAM_URL, "last_seen": {"$gte": stale_threshold}
     })
+
+    limit_line = (
+        f"  - Limit: `Unlimited` ♾️\n"
+        if not bw_info["limit_enabled"]
+        else f"  - Limit: `{bw_info['used_human']}` / `{bw_info['kill_threshold_human']}` ({bw_info['percent']}%)\n"
+    )
 
     text = (
         f"**📊 Bot Statistics (V4.5)**\n\n"
         f"**Bot:** @{BOT_USERNAME or 'Unknown'}  |  **Status:** {dead_status}\n"
         f"**Uptime:** `{uptime}`\n\n"
-        
         f"**🔥 LIVE VIEWERS (Real-time):**\n"
-        f"  🌍 `All Bots Live Count   :` **{total_live_all}** watching\n"
+        f"  🌍 `All Bots Live Count :` **{total_live_all}** watching\n"
         f"  📍 `This Bot Live Count :` **{total_live_this}** watching\n\n"
-        
         f"**🌐 Bandwidth (This Bot):**\n"
-        f"  - Used: `{bw_info['used_human']}` / 90 GB\n"
-        f"  - Progress: `{bw_info['percent']}%`\n"
-        f"  - 85 GB Warning Sent: `{bw_info['warning_sent']}`\n\n"
+        f"{limit_line}"
+        f"  - Warning Sent: `{bw_info['warning_sent']}`\n\n"
         f"**🖥️ System:**\n"
         f"  - CPU: `{cpu_usage}%`\n"
         f"  - RAM: `{ram_usage}%` (Total: `{ram_total}`)\n"
@@ -1717,25 +1567,18 @@ async def stats_callback(client, cb: CallbackQuery):
 
 @main_bot.on_callback_query(filters.regex("^admin_lifetime_stats$") & admin_only)
 async def lifetime_stats_callback(client, cb: CallbackQuery):
-    """
-    Shows the PERMANENT global lifetime stats shared across ALL bots.
-    Reads the single {"_id": "global_stats"} document from MongoDB.
-    """
+    """Shows the PERMANENT global lifetime stats shared across ALL bots."""
     await cb.answer("Fetching lifetime stats...")
-
     stats = await get_lifetime_stats()
-
     text = (
         f"**📈 Lifetime Global Statistics**\n\n"
-        f"These figures represent the combined total across "
-        f"**ALL bots you have ever deployed** on this system.\n"
-        f"This data is stored in MongoDB and is **permanent — never deleted.**\n\n"
-        f"**💾 Total Bandwidth Served to Users:**\n"
+        f"Combined total across **ALL bots** ever deployed on this system.\n"
+        f"Stored in MongoDB — **permanent, never deleted.**\n\n"
+        f"**💾 Total Bandwidth Served:**\n"
         f"  `{stats['total_bandwidth_human']}`\n\n"
         f"**▶️ Total Video Streams Started:**\n"
         f"  `{stats['total_streams']:,}` streams"
     )
-
     await cb.message.edit_text(
         text,
         reply_markup=InlineKeyboardMarkup(
@@ -1743,6 +1586,446 @@ async def lifetime_stats_callback(client, cb: CallbackQuery):
         )
     )
 
+
+# ── Bandwidth Limits (NEW) ────────────────────────────────────────────────────
+
+@main_bot.on_callback_query(filters.regex("^admin_bw_limits$") & admin_only)
+async def bw_limits_menu_callback(client, cb: CallbackQuery):
+    """Main Bandwidth Limits menu — choose Global or Specific bot settings."""
+    await cb.answer()
+    await update_user_conversation(cb.message.chat.id, None)
+
+    global_cfg   = await get_global_bw_config()
+    specific_cfg = await get_specific_bw_config(Config.STREAM_URL)
+
+    if specific_cfg is not None:
+        active_rule = (
+            f"📍 **This Bot:** {'🟢 ON' if specific_cfg['enabled'] else '🔴 OFF (Unlimited)'} "
+            f"— `{humanbytes(specific_cfg['limit_bytes']) if specific_cfg['enabled'] else 'Unlimited'}`"
+        )
+    elif global_cfg is not None:
+        active_rule = (
+            f"🌍 **Global (fallback):** {'🟢 ON' if global_cfg['enabled'] else '🔴 OFF (Unlimited)'} "
+            f"— `{humanbytes(global_cfg['limit_bytes']) if global_cfg['enabled'] else 'Unlimited'}`"
+        )
+    else:
+        active_rule = (
+            f"⚙️ **Config Default:** "
+            f"{'🟢 ON — ' + humanbytes(Config.BANDWIDTH_KILL_BYTES) if Config.DEFAULT_LIMIT_MODE else '🔴 Unlimited'}"
+        )
+
+    current_effective = (
+        f"♾️ Unlimited" if not _effective_limit_enabled
+        else humanbytes(_effective_limit_bytes)
+    )
+
+    text = (
+        f"**🚦 Bandwidth Limit Controls**\n\n"
+        f"**Current Effective Limit:** `{current_effective}`\n"
+        f"**Active Rule:** {active_rule}\n\n"
+        f"**Override Priority:**\n"
+        f"  Specific Bot > Global > Config Default\n\n"
+        f"Choose what to configure:"
+    )
+
+    await cb.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🌍 Global Settings (All Bots)", callback_data="admin_bw_global")],
+            [InlineKeyboardButton("📍 Specific Bot Settings",       callback_data="admin_bw_specific")],
+            [InlineKeyboardButton("⬅️ Back to Menu",               callback_data="admin_main_menu")],
+        ])
+    )
+
+
+# ── Global BW Settings ────────────────────────────────────────────────────────
+
+@main_bot.on_callback_query(filters.regex("^admin_bw_global$") & admin_only)
+async def bw_global_callback(client, cb: CallbackQuery):
+    """Shows the current global BW limit and toggle/set options."""
+    await cb.answer()
+
+    cfg = await get_global_bw_config()
+    if cfg is None:
+        status_str = (
+            f"Not set — using Config default: "
+            f"{'🟢 ON (' + humanbytes(Config.BANDWIDTH_KILL_BYTES) + ')' if Config.DEFAULT_LIMIT_MODE else '🔴 Unlimited'}"
+        )
+        enabled    = Config.DEFAULT_LIMIT_MODE
+        limit_bytes = Config.BANDWIDTH_KILL_BYTES
+    else:
+        enabled     = cfg["enabled"]
+        limit_bytes = cfg.get("limit_bytes", Config.BANDWIDTH_KILL_BYTES)
+        status_str  = (
+            f"{'🟢 ON' if enabled else '🔴 OFF (Unlimited)'} — "
+            f"`{humanbytes(limit_bytes) if enabled else 'Unlimited'}`"
+        )
+
+    toggle_label = "🔴 Turn OFF (Unlimited)" if enabled else "🟢 Turn ON"
+
+    text = (
+        f"**🌍 Global Bandwidth Settings**\n\n"
+        f"This rule applies to **all bots** that share this MongoDB database, "
+        f"unless overridden by a Specific Bot rule.\n\n"
+        f"**Current Status:** {status_str}\n\n"
+        f"What would you like to do?"
+    )
+
+    await cb.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(toggle_label,             callback_data="admin_bw_global_tog")],
+            [InlineKeyboardButton("✏️ Set Custom Limit (GB)", callback_data="admin_bw_global_setlimit")],
+            [InlineKeyboardButton("⬅️ Back",                 callback_data="admin_bw_limits")],
+        ])
+    )
+
+
+@main_bot.on_callback_query(filters.regex("^admin_bw_global_tog$") & admin_only)
+async def bw_global_toggle_confirm_callback(client, cb: CallbackQuery):
+    """Shows confirmation before toggling the global BW limit."""
+    await cb.answer()
+
+    cfg     = await get_global_bw_config()
+    enabled = cfg["enabled"] if cfg else Config.DEFAULT_LIMIT_MODE
+
+    new_state_str = "🔴 OFF (Unlimited — all bots run forever)" if enabled else "🟢 ON"
+    warning_str   = (
+        "\n\n⚠️ **Warning:** Turning the limit OFF means ALL bots with no specific rule "
+        "will run with **no bandwidth cap at all.** Make sure this is intended."
+        if enabled else ""
+    )
+
+    await cb.message.edit_text(
+        f"**⚠️ Confirm Global Limit Change**\n\n"
+        f"You are about to toggle the Global Limit to: **{new_state_str}**\n"
+        f"This will affect **all bots** sharing this database.{warning_str}\n\n"
+        f"Are you sure?",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Yes, Apply",   callback_data="admin_bw_global_tog_yes"),
+                InlineKeyboardButton("❌ No, Cancel",   callback_data="admin_bw_global"),
+            ]
+        ])
+    )
+
+
+@main_bot.on_callback_query(filters.regex("^admin_bw_global_tog_yes$") & admin_only)
+async def bw_global_toggle_apply_callback(client, cb: CallbackQuery):
+    """Applies the global BW limit toggle."""
+    await cb.answer("Applying...")
+
+    cfg         = await get_global_bw_config()
+    enabled     = cfg["enabled"] if cfg else Config.DEFAULT_LIMIT_MODE
+    limit_bytes = cfg.get("limit_bytes", Config.BANDWIDTH_KILL_BYTES) if cfg else Config.BANDWIDTH_KILL_BYTES
+
+    new_enabled = not enabled
+    await set_global_bw_config(new_enabled, limit_bytes)
+    await refresh_effective_limit()
+
+    new_str = "🔴 OFF (Unlimited)" if not new_enabled else f"🟢 ON ({humanbytes(limit_bytes)})"
+    await cb.message.edit_text(
+        f"✅ **Global Bandwidth Limit updated!**\n\n"
+        f"**New Status:** {new_str}\n\n"
+        f"All bots without a specific rule will pick this up within **60 seconds** automatically.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Back to Global Settings", callback_data="admin_bw_global")],
+            [InlineKeyboardButton("🏠 Main Menu",               callback_data="admin_main_menu")],
+        ])
+    )
+
+
+@main_bot.on_callback_query(filters.regex("^admin_bw_global_setlimit$") & admin_only)
+async def bw_global_setlimit_callback(client, cb: CallbackQuery):
+    """Prompts admin to type a new global limit in GB."""
+    await cb.answer()
+    await update_user_conversation(cb.message.chat.id, {"stage": "bw_awaiting_global_limit"})
+    await cb.message.edit_text(
+        "**✏️ Set Global Bandwidth Limit**\n\n"
+        "Send the new limit as a **number in GB**.\n\n"
+        "Examples: `90`, `150`, `200`\n\n"
+        "This limit will apply to **all bots** that have no specific rule set.",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("❌ Cancel", callback_data="admin_bw_global")]]
+        )
+    )
+
+
+# ── Specific Bot BW Settings ──────────────────────────────────────────────────
+
+@main_bot.on_callback_query(filters.regex("^admin_bw_specific$") & admin_only)
+async def bw_specific_list_callback(client, cb: CallbackQuery):
+    """Lists all bots from bandwidth_collection for specific rule management."""
+    await cb.answer("Loading bot list...")
+
+    cursor   = bandwidth_collection.find({}, {"_id": 1, "bot_username": 1, "bandwidth_used": 1, "is_dead": 1})
+    bot_docs = await cursor.to_list(length=20)
+
+    if not bot_docs:
+        await cb.message.edit_text(
+            "**📍 Specific Bot Settings**\n\nNo bots found in the database yet.\n"
+            "Bots appear here once they have streamed at least once.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Back", callback_data="admin_bw_limits")]]
+            )
+        )
+        return
+
+    # Save ordered list in conv state for index-based selection
+    bot_urls = [doc["_id"] for doc in bot_docs]
+    await update_user_conversation(
+        cb.message.chat.id,
+        {"stage": "bw_selecting_bot", "bw_bot_list": bot_urls}
+    )
+
+    buttons = []
+    for idx, doc in enumerate(bot_docs):
+        url       = doc["_id"]
+        username  = doc.get("bot_username") or "unknown"
+        used      = humanbytes(doc.get("bandwidth_used", 0))
+        dead_icon = "🔴" if doc.get("is_dead") else "🟢"
+        is_this   = " ← This Bot" if url == Config.STREAM_URL else ""
+        label     = f"{dead_icon} @{username} | {used}{is_this}"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"admin_bw_sel_{idx}")])
+
+    buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="admin_bw_limits")])
+
+    await cb.message.edit_text(
+        f"**📍 Specific Bot Settings**\n\n"
+        f"Select a bot to configure its individual bandwidth rule.\n"
+        f"Specific rules **always override** the global rule.\n\n"
+        f"({len(bot_docs)} bots found)",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+
+@main_bot.on_callback_query(filters.regex(r"^admin_bw_sel_(\d+)$") & admin_only)
+async def bw_specific_bot_panel_callback(client, cb: CallbackQuery):
+    """Shows the specific BW rule panel for the selected bot."""
+    await cb.answer()
+
+    idx  = int(cb.data.split("_")[-1])
+    conv = await get_user_conversation(cb.message.chat.id)
+    if not conv or "bw_bot_list" not in conv:
+        await cb.message.edit_text(
+            "⚠️ Session expired. Please go back and select a bot again.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Back", callback_data="admin_bw_specific")]]
+            )
+        )
+        return
+
+    bot_list = conv["bw_bot_list"]
+    if idx >= len(bot_list):
+        await cb.answer("Invalid selection. Please go back.", show_alert=True)
+        return
+
+    target_url  = bot_list[idx]
+    specific_cfg = await get_specific_bw_config(target_url)
+    bw_doc       = await bandwidth_collection.find_one({"_id": target_url})
+
+    username  = bw_doc.get("bot_username", "unknown") if bw_doc else "unknown"
+    used      = humanbytes(bw_doc.get("bandwidth_used", 0)) if bw_doc else "N/A"
+    is_dead   = bw_doc.get("is_dead", False) if bw_doc else False
+
+    if specific_cfg is not None:
+        enabled    = specific_cfg["enabled"]
+        limit_bytes = specific_cfg.get("limit_bytes", Config.BANDWIDTH_KILL_BYTES)
+        rule_str   = (
+            f"{'🟢 ON' if enabled else '🔴 OFF (Unlimited)'} — "
+            f"`{humanbytes(limit_bytes) if enabled else 'Unlimited'}`"
+        )
+        rule_source = "📍 **Specific Rule Set**"
+    else:
+        global_cfg = await get_global_bw_config()
+        rule_source = "🌍 **No specific rule — using Global/Default**"
+        if global_cfg:
+            enabled     = global_cfg["enabled"]
+            limit_bytes = global_cfg.get("limit_bytes", Config.BANDWIDTH_KILL_BYTES)
+        else:
+            enabled     = Config.DEFAULT_LIMIT_MODE
+            limit_bytes = Config.BANDWIDTH_KILL_BYTES
+        rule_str = (
+            f"{'🟢 ON' if enabled else '🔴 OFF'} — "
+            f"`{humanbytes(limit_bytes) if enabled else 'Unlimited'}` (inherited)"
+        )
+
+    # Store selected URL in conv state for subsequent actions
+    await update_user_conversation(
+        cb.message.chat.id,
+        {"stage": "bw_bot_panel", "bw_bot_list": bot_list, "bw_selected_url": target_url}
+    )
+
+    toggle_label = "🔴 Turn OFF for This Bot" if enabled else "🟢 Turn ON for This Bot"
+
+    text = (
+        f"**📍 Specific Rule: @{username}**\n\n"
+        f"**URL:** `{target_url}`\n"
+        f"**Status:** {'🔴 DEAD' if is_dead else '🟢 Active'}\n"
+        f"**BW Used:** `{used}`\n\n"
+        f"**Current Rule:** {rule_str}\n"
+        f"**Source:** {rule_source}\n\n"
+        f"What would you like to do for **this bot specifically**?"
+    )
+
+    buttons = [
+        [InlineKeyboardButton(toggle_label,                 callback_data="admin_bw_seltog")],
+        [InlineKeyboardButton("✏️ Set Custom Limit (GB)",   callback_data="admin_bw_selset")],
+    ]
+    if specific_cfg is not None:
+        buttons.append([InlineKeyboardButton("🗑️ Remove Specific Rule (Use Global)", callback_data="admin_bw_selrem")])
+    buttons.append([InlineKeyboardButton("⬅️ Back to Bot List", callback_data="admin_bw_specific")])
+
+    await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+@main_bot.on_callback_query(filters.regex("^admin_bw_seltog$") & admin_only)
+async def bw_specific_toggle_confirm_callback(client, cb: CallbackQuery):
+    """Confirms toggling the specific bot BW limit."""
+    await cb.answer()
+
+    conv = await get_user_conversation(cb.message.chat.id)
+    if not conv or "bw_selected_url" not in conv:
+        await cb.answer("Session expired. Go back and reselect.", show_alert=True)
+        return
+
+    target_url   = conv["bw_selected_url"]
+    specific_cfg = await get_specific_bw_config(target_url)
+    enabled      = specific_cfg["enabled"] if specific_cfg else Config.DEFAULT_LIMIT_MODE
+
+    new_state_str = "🔴 OFF (Unlimited)" if enabled else "🟢 ON"
+    await cb.message.edit_text(
+        f"**⚠️ Confirm Specific Rule Toggle**\n\n"
+        f"Bot URL: `{target_url}`\n\n"
+        f"Toggle limit to: **{new_state_str}**\n\n"
+        f"Are you sure? This only affects **this specific bot**.",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Yes, Apply",  callback_data="admin_bw_seltog_yes"),
+                InlineKeyboardButton("❌ Cancel",       callback_data="admin_bw_specific"),
+            ]
+        ])
+    )
+
+
+@main_bot.on_callback_query(filters.regex("^admin_bw_seltog_yes$") & admin_only)
+async def bw_specific_toggle_apply_callback(client, cb: CallbackQuery):
+    """Applies the specific bot BW toggle."""
+    await cb.answer("Applying...")
+
+    conv = await get_user_conversation(cb.message.chat.id)
+    if not conv or "bw_selected_url" not in conv:
+        await cb.answer("Session expired.", show_alert=True)
+        return
+
+    target_url   = conv["bw_selected_url"]
+    specific_cfg = await get_specific_bw_config(target_url)
+    enabled      = specific_cfg["enabled"] if specific_cfg else Config.DEFAULT_LIMIT_MODE
+    limit_bytes  = specific_cfg.get("limit_bytes", Config.BANDWIDTH_KILL_BYTES) if specific_cfg else Config.BANDWIDTH_KILL_BYTES
+
+    new_enabled = not enabled
+    await set_specific_bw_config(target_url, new_enabled, limit_bytes)
+
+    # If this bot is the running one, refresh immediately
+    if target_url == Config.STREAM_URL:
+        await refresh_effective_limit()
+
+    new_str = "🔴 OFF (Unlimited)" if not new_enabled else f"🟢 ON ({humanbytes(limit_bytes)})"
+    await cb.message.edit_text(
+        f"✅ **Specific Rule Updated!**\n\n"
+        f"**Bot:** `{target_url}`\n"
+        f"**New Status:** {new_str}\n\n"
+        f"The bot will pick up the change within **60 seconds** (or instantly if it's this bot).",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Back to Bot List", callback_data="admin_bw_specific")],
+            [InlineKeyboardButton("🏠 Main Menu",        callback_data="admin_main_menu")],
+        ])
+    )
+
+
+@main_bot.on_callback_query(filters.regex("^admin_bw_selset$") & admin_only)
+async def bw_specific_setlimit_callback(client, cb: CallbackQuery):
+    """Prompts admin to type a custom limit in GB for the selected bot."""
+    await cb.answer()
+
+    conv = await get_user_conversation(cb.message.chat.id)
+    if not conv or "bw_selected_url" not in conv:
+        await cb.answer("Session expired. Go back.", show_alert=True)
+        return
+
+    target_url = conv["bw_selected_url"]
+    # Update stage but preserve selected URL and bot list
+    await update_user_conversation(cb.message.chat.id, {
+        "stage":           "bw_awaiting_specific_limit",
+        "bw_selected_url": target_url,
+        "bw_bot_list":     conv.get("bw_bot_list", [])
+    })
+
+    await cb.message.edit_text(
+        f"**✏️ Set Specific Limit for This Bot**\n\n"
+        f"Bot: `{target_url}`\n\n"
+        f"Send the new limit as a **number in GB**.\n\n"
+        f"Examples: `90`, `150`, `180`, `200`",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("❌ Cancel", callback_data="admin_bw_specific")]]
+        )
+    )
+
+
+@main_bot.on_callback_query(filters.regex("^admin_bw_selrem$") & admin_only)
+async def bw_specific_remove_confirm_callback(client, cb: CallbackQuery):
+    """Confirms removing the specific rule for the selected bot."""
+    await cb.answer()
+
+    conv = await get_user_conversation(cb.message.chat.id)
+    if not conv or "bw_selected_url" not in conv:
+        await cb.answer("Session expired. Go back.", show_alert=True)
+        return
+
+    target_url = conv["bw_selected_url"]
+    await cb.message.edit_text(
+        f"**⚠️ Confirm Remove Specific Rule**\n\n"
+        f"Bot: `{target_url}`\n\n"
+        f"Removing the specific rule will make this bot fall back to the **Global rule** "
+        f"(or Config default if no global is set).\n\n"
+        f"Are you sure?",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Yes, Remove",  callback_data="admin_bw_selrem_yes"),
+                InlineKeyboardButton("❌ Cancel",        callback_data="admin_bw_specific"),
+            ]
+        ])
+    )
+
+
+@main_bot.on_callback_query(filters.regex("^admin_bw_selrem_yes$") & admin_only)
+async def bw_specific_remove_apply_callback(client, cb: CallbackQuery):
+    """Removes the specific BW rule, reverting the bot to global settings."""
+    await cb.answer("Removing...")
+
+    conv = await get_user_conversation(cb.message.chat.id)
+    if not conv or "bw_selected_url" not in conv:
+        await cb.answer("Session expired.", show_alert=True)
+        return
+
+    target_url = conv["bw_selected_url"]
+    await delete_specific_bw_config(target_url)
+
+    if target_url == Config.STREAM_URL:
+        await refresh_effective_limit()
+
+    await cb.message.edit_text(
+        f"✅ **Specific Rule Removed!**\n\n"
+        f"Bot `{target_url}` now follows the **Global rule** (or Config default).\n\n"
+        f"Change takes effect within 60 seconds.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Back to Bot List", callback_data="admin_bw_specific")],
+            [InlineKeyboardButton("🏠 Main Menu",        callback_data="admin_main_menu")],
+        ])
+    )
+
+
+# ── Settings ──────────────────────────────────────────────────────────────────
 
 @main_bot.on_callback_query(filters.regex("^admin_settings$") & admin_only)
 async def settings_callback(client, cb: CallbackQuery):
@@ -1790,6 +2073,8 @@ async def set_domain_callback(client, cb: CallbackQuery):
     )
 
 
+# ── Kill Bot ──────────────────────────────────────────────────────────────────
+
 @main_bot.on_callback_query(filters.regex("^admin_kill_bot$") & admin_only)
 async def kill_bot_callback(client, cb: CallbackQuery):
     """Shows the Kill Bot confirmation dialog."""
@@ -1799,7 +2084,7 @@ async def kill_bot_callback(client, cb: CallbackQuery):
         await cb.message.edit_text(
             "🔴 **This bot is already in Sleep (Dead) Mode.**\n\n"
             "It is not serving any video streams.\n"
-            "Deploy a new bot to resume service.",
+            "Use **🚦 Bandwidth Limits** in the admin panel to revive it instantly.",
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("⬅️ Back", callback_data="admin_main_menu")]]
             )
@@ -1813,7 +2098,7 @@ async def kill_bot_callback(client, cb: CallbackQuery):
         f"**Bandwidth Used:** `{bw_info['used_human']}`\n\n"
         f"The bot will **permanently stop serving all video files.**\n"
         f"This state is saved to MongoDB and **survives restarts.**\n\n"
-        f"You will need to deploy a new bot to continue service.",
+        f"You can revive it via **Admin Panel → 🚦 Bandwidth Limits** without restarting.",
         reply_markup=InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("✅ Yes, Kill It",  callback_data="admin_kill_bot_confirm"),
@@ -1827,16 +2112,16 @@ async def kill_bot_callback(client, cb: CallbackQuery):
 async def kill_bot_confirm_callback(client, cb: CallbackQuery):
     """Admin confirmed kill — triggers Dead Mode manually."""
     await cb.answer("Killing bot...")
-
     await cb.message.edit_text(
         "🔴 **Bot is now in Sleep (Dead) Mode.**\n\n"
         "All video streams have been blocked immediately.\n"
         "This state is saved to the database and will persist on restart.\n\n"
-        "Deploy a new bot on a new Render account to continue service."
+        "**To revive:** Admin Panel → 🚦 Bandwidth Limits → increase limit or turn OFF."
     )
-
     await trigger_dead_mode(reason="manual")
 
+
+# ── Restart ───────────────────────────────────────────────────────────────────
 
 @main_bot.on_callback_query(filters.regex("^admin_restart$") & admin_only)
 async def restart_callback(client, cb: CallbackQuery):
@@ -1859,7 +2144,6 @@ async def restart_confirm_callback(client, cb: CallbackQuery):
     """Admin confirmed restart — flushes bandwidth to DB then restarts process."""
     await cb.answer("Restarting...")
     await cb.message.edit_text("✅ **Restarting...**\n\nBot will be back online shortly.")
-
     try:
         LOGGER.info("RESTART triggered by admin.")
         await flush_bandwidth_to_db()
@@ -1868,9 +2152,10 @@ async def restart_confirm_callback(client, cb: CallbackQuery):
             await main_bot.stop()
     except Exception as e:
         LOGGER.error(f"Error during pre-restart cleanup: {e}")
-
     os.execl(sys.executable, sys.executable, *sys.argv)
 
+
+# ── Navigation / Cancel ───────────────────────────────────────────────────────
 
 @main_bot.on_callback_query(
     filters.regex("^(admin_main_menu|admin_cancel_conv)$") & admin_only
@@ -1885,6 +2170,8 @@ async def main_menu_callback(client, cb: CallbackQuery):
     )
 
 
+# ── Text Message Handler (all free-text admin input flows) ────────────────────
+
 @main_bot.on_message(filters.private & filters.text & admin_only)
 async def text_message_handler(client, message: Message):
     """Handles free-text input from admin during active conversation flows."""
@@ -1895,6 +2182,7 @@ async def text_message_handler(client, message: Message):
 
     stage = conv.get("stage")
 
+    # ── Existing: Protected Domain ────────────────────────────────────────────
     if stage == "awaiting_domain":
         new_domain = message.text.strip()
         if "." not in new_domain or " " in new_domain:
@@ -1914,10 +2202,146 @@ async def text_message_handler(client, message: Message):
         except Exception as e:
             await message.reply_text(f"❌ **Error!**\nCould not save domain: `{e}`")
 
+    # ── New: Global BW Limit Value ────────────────────────────────────────────
+    elif stage == "bw_awaiting_global_limit":
+        raw_val = message.text.strip().replace("gb", "").replace("GB", "").strip()
+        try:
+            gb_val = float(raw_val)
+            if gb_val <= 0:
+                raise ValueError("Must be positive")
+        except ValueError:
+            return await message.reply_text(
+                "❌ Invalid value. Please send a positive number in GB, e.g. `150`."
+            )
 
-# ================================================================================
-# APPLICATION LIFECYCLE
-# ================================================================================
+        limit_bytes = int(gb_val * 1024 * 1024 * 1024)
+        status_msg  = await message.reply_text("⏳ Saving...")
+
+        # Ask for confirmation
+        await update_user_conversation(chat_id, {
+            "stage":                 "bw_confirm_global_limit",
+            "bw_pending_limit_bytes": limit_bytes
+        })
+        await status_msg.edit_text(
+            f"**⚠️ Confirm Global Limit Change**\n\n"
+            f"New Global Limit: **{humanbytes(limit_bytes)}** (`{gb_val:.1f} GB`)\n\n"
+            f"This will apply to **all bots** sharing this database.\n"
+            f"Are you sure?",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Yes, Save",  callback_data="admin_bw_global_limit_confirm"),
+                    InlineKeyboardButton("❌ Cancel",      callback_data="admin_bw_global"),
+                ]
+            ])
+        )
+
+    # ── New: Specific Bot BW Limit Value ──────────────────────────────────────
+    elif stage == "bw_awaiting_specific_limit":
+        raw_val = message.text.strip().replace("gb", "").replace("GB", "").strip()
+        try:
+            gb_val = float(raw_val)
+            if gb_val <= 0:
+                raise ValueError("Must be positive")
+        except ValueError:
+            return await message.reply_text(
+                "❌ Invalid value. Please send a positive number in GB, e.g. `150`."
+            )
+
+        target_url  = conv.get("bw_selected_url", "")
+        limit_bytes = int(gb_val * 1024 * 1024 * 1024)
+        status_msg  = await message.reply_text("⏳ Saving...")
+
+        await update_user_conversation(chat_id, {
+            "stage":                  "bw_confirm_specific_limit",
+            "bw_selected_url":        target_url,
+            "bw_bot_list":            conv.get("bw_bot_list", []),
+            "bw_pending_limit_bytes": limit_bytes
+        })
+        await status_msg.edit_text(
+            f"**⚠️ Confirm Specific Limit Change**\n\n"
+            f"Bot: `{target_url}`\n"
+            f"New Limit: **{humanbytes(limit_bytes)}** (`{gb_val:.1f} GB`)\n\n"
+            f"Are you sure?",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Yes, Save",  callback_data="admin_bw_specific_limit_confirm"),
+                    InlineKeyboardButton("❌ Cancel",      callback_data="admin_bw_specific"),
+                ]
+            ])
+        )
+
+
+# ── Confirmation callbacks for custom limit values ────────────────────────────
+
+@main_bot.on_callback_query(filters.regex("^admin_bw_global_limit_confirm$") & admin_only)
+async def bw_global_limit_confirm_callback(client, cb: CallbackQuery):
+    """Saves the confirmed global bandwidth limit."""
+    await cb.answer("Saving...")
+
+    conv = await get_user_conversation(cb.message.chat.id)
+    if not conv or "bw_pending_limit_bytes" not in conv:
+        await cb.answer("Session expired.", show_alert=True)
+        return
+
+    limit_bytes = conv["bw_pending_limit_bytes"]
+    # Keep existing enabled state, just update limit
+    existing = await get_global_bw_config()
+    enabled  = existing["enabled"] if existing else Config.DEFAULT_LIMIT_MODE
+
+    await set_global_bw_config(enabled, limit_bytes)
+    await refresh_effective_limit()
+    await update_user_conversation(cb.message.chat.id, None)
+
+    await cb.message.edit_text(
+        f"✅ **Global Limit Saved!**\n\n"
+        f"**New Limit:** `{humanbytes(limit_bytes)}`\n"
+        f"**Status:** {'🟢 ON' if enabled else '🔴 OFF (Unlimited)'}\n\n"
+        f"All bots without a specific rule will update within **60 seconds** automatically.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Global Settings", callback_data="admin_bw_global")],
+            [InlineKeyboardButton("🏠 Main Menu",       callback_data="admin_main_menu")],
+        ])
+    )
+
+
+@main_bot.on_callback_query(filters.regex("^admin_bw_specific_limit_confirm$") & admin_only)
+async def bw_specific_limit_confirm_callback(client, cb: CallbackQuery):
+    """Saves the confirmed specific bot bandwidth limit."""
+    await cb.answer("Saving...")
+
+    conv = await get_user_conversation(cb.message.chat.id)
+    if not conv or "bw_pending_limit_bytes" not in conv or "bw_selected_url" not in conv:
+        await cb.answer("Session expired.", show_alert=True)
+        return
+
+    target_url  = conv["bw_selected_url"]
+    limit_bytes = conv["bw_pending_limit_bytes"]
+
+    # Keep existing enabled state, just update limit
+    existing = await get_specific_bw_config(target_url)
+    enabled  = existing["enabled"] if existing else Config.DEFAULT_LIMIT_MODE
+
+    await set_specific_bw_config(target_url, enabled, limit_bytes)
+
+    if target_url == Config.STREAM_URL:
+        await refresh_effective_limit()
+
+    await update_user_conversation(cb.message.chat.id, None)
+
+    await cb.message.edit_text(
+        f"✅ **Specific Limit Saved!**\n\n"
+        f"**Bot:** `{target_url}`\n"
+        f"**New Limit:** `{humanbytes(limit_bytes)}`\n"
+        f"**Status:** {'🟢 ON' if enabled else '🔴 OFF (Unlimited)'}\n\n"
+        f"The bot will update within **60 seconds** (or instantly if it's this bot).",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Back to Bot List", callback_data="admin_bw_specific")],
+            [InlineKeyboardButton("🏠 Main Menu",        callback_data="admin_main_menu")],
+        ])
+    )
+
+
+# ── SECTION 16: APPLICATION LIFECYCLE ────────────────────────────────────────
 
 async def ping_server():
     """Keeps the Render/Heroku dyno alive by self-pinging at a regular interval."""
@@ -1967,11 +2391,13 @@ if __name__ == "__main__":
             LOGGER.critical(f"Failed to start main bot: {e}", exc_info=True)
             raise
 
-        # ── Step 4: Load bandwidth state from MongoDB ─────────────────────────
+        # ── Step 4: Load bandwidth state (also calls refresh_effective_limit) ─
         await load_bandwidth_state()
+        eff_limit_str = "Unlimited" if not _effective_limit_enabled else humanbytes(_effective_limit_bytes)
         LOGGER.info(
             f"Bandwidth state: Used={humanbytes(_bandwidth_in_memory)}, "
-            f"Dead={IS_DEAD}, WarningSent={_warning_85gb_sent}"
+            f"Dead={IS_DEAD}, WarningSent={_warning_85gb_sent}, "
+            f"EffectiveLimit={eff_limit_str}"
         )
 
         # ── Step 5: Initialize multi-client streaming ─────────────────────────
@@ -1993,13 +2419,16 @@ if __name__ == "__main__":
         try:
             bw_info     = get_bandwidth_info()
             dead_notice = (
-                "\n\n🔴 **WARNING: This bot is STILL in Dead Mode from the previous run!**"
+                "\n\n🔴 **WARNING: This bot is STILL in Dead Mode from the previous run!**\n"
+                "Use **Admin Panel → 🚦 Bandwidth Limits** to revive without restarting."
                 if IS_DEAD else ""
             )
+            eff_str = "♾️ Unlimited" if not _effective_limit_enabled else humanbytes(_effective_limit_bytes)
             await main_bot.send_message(
                 Config.ADMIN_IDS[0],
                 f"**✅ Bot @{BOT_USERNAME} is online! (V4.5)**\n\n"
-                f"**Bandwidth Used:** `{bw_info['used_human']}` / 90 GB\n"
+                f"**Bandwidth Used:** `{bw_info['used_human']}`\n"
+                f"**Effective Limit:** `{eff_str}`\n"
                 f"**Status:** {'🔴 DEAD' if IS_DEAD else '🟢 Active'}\n\n"
                 f"**🔒 V4.5 Security Active:**\n"
                 f"  - Connection Lifespan: `{Config.MAX_CONNECTION_LIFESPAN_SECS}s`\n"
@@ -2007,7 +2436,10 @@ if __name__ == "__main__":
                 f"  - UA Fingerprinting: `ON ({len(_BLOCKED_UA_FRAGMENTS)} patterns)`\n"
                 f"  - Header Integrity Check: `ON`\n"
                 f"  - Throttle Jitter: `±{Config.THROTTLE_JITTER_SECS}s`\n"
-                f"  - Escalation: `>{Config.DATA_ESCALATION_MB}MB → {Config.DATA_ESCALATION_SLEEP}s`"
+                f"  - Escalation: `>{Config.DATA_ESCALATION_MB}MB → {Config.DATA_ESCALATION_SLEEP}s`\n\n"
+                f"**🚦 Dynamic BW Limit System: ACTIVE**\n"
+                f"  - Default Mode: `{'Limit ON' if Config.DEFAULT_LIMIT_MODE else 'Unlimited (VPS)'}`\n"
+                f"  - Auto-Revive: `ON` (checks DB every 60s)"
                 f"{dead_notice}"
             )
         except Exception as e:
