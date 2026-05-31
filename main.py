@@ -1532,7 +1532,7 @@ async def stats_callback(client, cb: CallbackQuery):
     })
 
     limit_line = (
-        f"  - Limit: `Unlimited` ♾️\n"
+        f"  - Limit: `{bw_info['used_human']}` / `Unlimited` ♾️\n"
         if not bw_info["limit_enabled"]
         else f"  - Limit: `{bw_info['used_human']}` / `{bw_info['kill_threshold_human']}` ({bw_info['percent']}%)\n"
     )
@@ -1591,7 +1591,7 @@ async def lifetime_stats_callback(client, cb: CallbackQuery):
 
 @main_bot.on_callback_query(filters.regex("^admin_bw_limits$") & admin_only)
 async def bw_limits_menu_callback(client, cb: CallbackQuery):
-    """Main Bandwidth Limits menu — choose Global or Specific bot settings."""
+    """Main Bandwidth Limits menu — choose Global or This Bot settings."""
     await cb.answer()
     await update_user_conversation(cb.message.chat.id, None)
 
@@ -1624,7 +1624,7 @@ async def bw_limits_menu_callback(client, cb: CallbackQuery):
         f"**Current Effective Limit:** `{current_effective}`\n"
         f"**Active Rule:** {active_rule}\n\n"
         f"**Override Priority:**\n"
-        f"  Specific Bot > Global > Config Default\n\n"
+        f"  This Bot > Global > Config Default\n\n"
         f"Choose what to configure:"
     )
 
@@ -1632,7 +1632,7 @@ async def bw_limits_menu_callback(client, cb: CallbackQuery):
         text,
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🌍 Global Settings (All Bots)", callback_data="admin_bw_global")],
-            [InlineKeyboardButton("📍 Specific Bot Settings",       callback_data="admin_bw_specific")],
+            [InlineKeyboardButton("📍 This Bot Settings",        callback_data="admin_bw_this_bot")],
             [InlineKeyboardButton("⬅️ Back to Menu",               callback_data="admin_main_menu")],
         ])
     )
@@ -1751,81 +1751,18 @@ async def bw_global_setlimit_callback(client, cb: CallbackQuery):
     )
 
 
-# ── Specific Bot BW Settings ──────────────────────────────────────────────────
+# ── Specific Bot BW Settings (Direct to THIS bot) ─────────────────────────────
 
-@main_bot.on_callback_query(filters.regex("^admin_bw_specific$") & admin_only)
-async def bw_specific_list_callback(client, cb: CallbackQuery):
-    """Lists all bots from bandwidth_collection for specific rule management."""
-    await cb.answer("Loading bot list...")
-
-    cursor   = bandwidth_collection.find({}, {"_id": 1, "bot_username": 1, "bandwidth_used": 1, "is_dead": 1})
-    bot_docs = await cursor.to_list(length=20)
-
-    if not bot_docs:
-        await cb.message.edit_text(
-            "**📍 Specific Bot Settings**\n\nNo bots found in the database yet.\n"
-            "Bots appear here once they have streamed at least once.",
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("⬅️ Back", callback_data="admin_bw_limits")]]
-            )
-        )
-        return
-
-    # Save ordered list in conv state for index-based selection
-    bot_urls = [doc["_id"] for doc in bot_docs]
-    await update_user_conversation(
-        cb.message.chat.id,
-        {"stage": "bw_selecting_bot", "bw_bot_list": bot_urls}
-    )
-
-    buttons = []
-    for idx, doc in enumerate(bot_docs):
-        url       = doc["_id"]
-        username  = doc.get("bot_username") or "unknown"
-        used      = humanbytes(doc.get("bandwidth_used", 0))
-        dead_icon = "🔴" if doc.get("is_dead") else "🟢"
-        is_this   = " ← This Bot" if url == Config.STREAM_URL else ""
-        label     = f"{dead_icon} @{username} | {used}{is_this}"
-        buttons.append([InlineKeyboardButton(label, callback_data=f"admin_bw_sel_{idx}")])
-
-    buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="admin_bw_limits")])
-
-    await cb.message.edit_text(
-        f"**📍 Specific Bot Settings**\n\n"
-        f"Select a bot to configure its individual bandwidth rule.\n"
-        f"Specific rules **always override** the global rule.\n\n"
-        f"({len(bot_docs)} bots found)",
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
-
-
-@main_bot.on_callback_query(filters.regex(r"^admin_bw_sel_(\d+)$") & admin_only)
+@main_bot.on_callback_query(filters.regex("^admin_bw_this_bot$") & admin_only)
 async def bw_specific_bot_panel_callback(client, cb: CallbackQuery):
-    """Shows the specific BW rule panel for the selected bot."""
+    """Shows the specific BW rule panel directly for the current bot."""
     await cb.answer()
 
-    idx  = int(cb.data.split("_")[-1])
-    conv = await get_user_conversation(cb.message.chat.id)
-    if not conv or "bw_bot_list" not in conv:
-        await cb.message.edit_text(
-            "⚠️ Session expired. Please go back and select a bot again.",
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("⬅️ Back", callback_data="admin_bw_specific")]]
-            )
-        )
-        return
-
-    bot_list = conv["bw_bot_list"]
-    if idx >= len(bot_list):
-        await cb.answer("Invalid selection. Please go back.", show_alert=True)
-        return
-
-    target_url  = bot_list[idx]
+    target_url   = Config.STREAM_URL
     specific_cfg = await get_specific_bw_config(target_url)
     bw_doc       = await bandwidth_collection.find_one({"_id": target_url})
 
-    username  = bw_doc.get("bot_username", "unknown") if bw_doc else "unknown"
-    used      = humanbytes(bw_doc.get("bandwidth_used", 0)) if bw_doc else "N/A"
+    used      = humanbytes(bw_doc.get("bandwidth_used", 0)) if bw_doc else "0 B"
     is_dead   = bw_doc.get("is_dead", False) if bw_doc else False
 
     if specific_cfg is not None:
@@ -1850,16 +1787,16 @@ async def bw_specific_bot_panel_callback(client, cb: CallbackQuery):
             f"`{humanbytes(limit_bytes) if enabled else 'Unlimited'}` (inherited)"
         )
 
-    # Store selected URL in conv state for subsequent actions
+    # Store selected URL in conv state for text handler
     await update_user_conversation(
         cb.message.chat.id,
-        {"stage": "bw_bot_panel", "bw_bot_list": bot_list, "bw_selected_url": target_url}
+        {"stage": "bw_bot_panel", "bw_selected_url": target_url}
     )
 
     toggle_label = "🔴 Turn OFF for This Bot" if enabled else "🟢 Turn ON for This Bot"
 
     text = (
-        f"**📍 Specific Rule: @{username}**\n\n"
+        f"**📍 Specific Rule: This Bot**\n\n"
         f"**URL:** `{target_url}`\n"
         f"**Status:** {'🔴 DEAD' if is_dead else '🟢 Active'}\n"
         f"**BW Used:** `{used}`\n\n"
@@ -1874,7 +1811,7 @@ async def bw_specific_bot_panel_callback(client, cb: CallbackQuery):
     ]
     if specific_cfg is not None:
         buttons.append([InlineKeyboardButton("🗑️ Remove Specific Rule (Use Global)", callback_data="admin_bw_selrem")])
-    buttons.append([InlineKeyboardButton("⬅️ Back to Bot List", callback_data="admin_bw_specific")])
+    buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="admin_bw_limits")])
 
     await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
@@ -1884,12 +1821,7 @@ async def bw_specific_toggle_confirm_callback(client, cb: CallbackQuery):
     """Confirms toggling the specific bot BW limit."""
     await cb.answer()
 
-    conv = await get_user_conversation(cb.message.chat.id)
-    if not conv or "bw_selected_url" not in conv:
-        await cb.answer("Session expired. Go back and reselect.", show_alert=True)
-        return
-
-    target_url   = conv["bw_selected_url"]
+    target_url   = Config.STREAM_URL
     specific_cfg = await get_specific_bw_config(target_url)
     enabled      = specific_cfg["enabled"] if specific_cfg else Config.DEFAULT_LIMIT_MODE
 
@@ -1902,7 +1834,7 @@ async def bw_specific_toggle_confirm_callback(client, cb: CallbackQuery):
         reply_markup=InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("✅ Yes, Apply",  callback_data="admin_bw_seltog_yes"),
-                InlineKeyboardButton("❌ Cancel",       callback_data="admin_bw_specific"),
+                InlineKeyboardButton("❌ Cancel",       callback_data="admin_bw_this_bot"),
             ]
         ])
     )
@@ -1913,31 +1845,22 @@ async def bw_specific_toggle_apply_callback(client, cb: CallbackQuery):
     """Applies the specific bot BW toggle."""
     await cb.answer("Applying...")
 
-    conv = await get_user_conversation(cb.message.chat.id)
-    if not conv or "bw_selected_url" not in conv:
-        await cb.answer("Session expired.", show_alert=True)
-        return
-
-    target_url   = conv["bw_selected_url"]
+    target_url   = Config.STREAM_URL
     specific_cfg = await get_specific_bw_config(target_url)
     enabled      = specific_cfg["enabled"] if specific_cfg else Config.DEFAULT_LIMIT_MODE
     limit_bytes  = specific_cfg.get("limit_bytes", Config.BANDWIDTH_KILL_BYTES) if specific_cfg else Config.BANDWIDTH_KILL_BYTES
 
     new_enabled = not enabled
     await set_specific_bw_config(target_url, new_enabled, limit_bytes)
-
-    # If this bot is the running one, refresh immediately
-    if target_url == Config.STREAM_URL:
-        await refresh_effective_limit()
+    await refresh_effective_limit()
 
     new_str = "🔴 OFF (Unlimited)" if not new_enabled else f"🟢 ON ({humanbytes(limit_bytes)})"
     await cb.message.edit_text(
         f"✅ **Specific Rule Updated!**\n\n"
-        f"**Bot:** `{target_url}`\n"
         f"**New Status:** {new_str}\n\n"
-        f"The bot will pick up the change within **60 seconds** (or instantly if it's this bot).",
+        f"The bot has picked up the change instantly.",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⬅️ Back to Bot List", callback_data="admin_bw_specific")],
+            [InlineKeyboardButton("⬅️ Back to This Bot", callback_data="admin_bw_this_bot")],
             [InlineKeyboardButton("🏠 Main Menu",        callback_data="admin_main_menu")],
         ])
     )
@@ -1948,17 +1871,10 @@ async def bw_specific_setlimit_callback(client, cb: CallbackQuery):
     """Prompts admin to type a custom limit in GB for the selected bot."""
     await cb.answer()
 
-    conv = await get_user_conversation(cb.message.chat.id)
-    if not conv or "bw_selected_url" not in conv:
-        await cb.answer("Session expired. Go back.", show_alert=True)
-        return
-
-    target_url = conv["bw_selected_url"]
-    # Update stage but preserve selected URL and bot list
+    target_url = Config.STREAM_URL
     await update_user_conversation(cb.message.chat.id, {
         "stage":           "bw_awaiting_specific_limit",
-        "bw_selected_url": target_url,
-        "bw_bot_list":     conv.get("bw_bot_list", [])
+        "bw_selected_url": target_url
     })
 
     await cb.message.edit_text(
@@ -1967,7 +1883,7 @@ async def bw_specific_setlimit_callback(client, cb: CallbackQuery):
         f"Send the new limit as a **number in GB**.\n\n"
         f"Examples: `90`, `150`, `180`, `200`",
         reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("❌ Cancel", callback_data="admin_bw_specific")]]
+            [[InlineKeyboardButton("❌ Cancel", callback_data="admin_bw_this_bot")]]
         )
     )
 
@@ -1977,22 +1893,16 @@ async def bw_specific_remove_confirm_callback(client, cb: CallbackQuery):
     """Confirms removing the specific rule for the selected bot."""
     await cb.answer()
 
-    conv = await get_user_conversation(cb.message.chat.id)
-    if not conv or "bw_selected_url" not in conv:
-        await cb.answer("Session expired. Go back.", show_alert=True)
-        return
-
-    target_url = conv["bw_selected_url"]
+    target_url = Config.STREAM_URL
     await cb.message.edit_text(
         f"**⚠️ Confirm Remove Specific Rule**\n\n"
-        f"Bot: `{target_url}`\n\n"
         f"Removing the specific rule will make this bot fall back to the **Global rule** "
         f"(or Config default if no global is set).\n\n"
         f"Are you sure?",
         reply_markup=InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("✅ Yes, Remove",  callback_data="admin_bw_selrem_yes"),
-                InlineKeyboardButton("❌ Cancel",        callback_data="admin_bw_specific"),
+                InlineKeyboardButton("❌ Cancel",        callback_data="admin_bw_this_bot"),
             ]
         ])
     )
@@ -2003,23 +1913,16 @@ async def bw_specific_remove_apply_callback(client, cb: CallbackQuery):
     """Removes the specific BW rule, reverting the bot to global settings."""
     await cb.answer("Removing...")
 
-    conv = await get_user_conversation(cb.message.chat.id)
-    if not conv or "bw_selected_url" not in conv:
-        await cb.answer("Session expired.", show_alert=True)
-        return
-
-    target_url = conv["bw_selected_url"]
+    target_url = Config.STREAM_URL
     await delete_specific_bw_config(target_url)
-
-    if target_url == Config.STREAM_URL:
-        await refresh_effective_limit()
+    await refresh_effective_limit()
 
     await cb.message.edit_text(
         f"✅ **Specific Rule Removed!**\n\n"
-        f"Bot `{target_url}` now follows the **Global rule** (or Config default).\n\n"
-        f"Change takes effect within 60 seconds.",
+        f"This bot now follows the **Global rule** (or Config default).\n\n"
+        f"Change took effect instantly.",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⬅️ Back to Bot List", callback_data="admin_bw_specific")],
+            [InlineKeyboardButton("⬅️ Back to This Bot", callback_data="admin_bw_this_bot")],
             [InlineKeyboardButton("🏠 Main Menu",        callback_data="admin_main_menu")],
         ])
     )
@@ -2265,7 +2168,7 @@ async def text_message_handler(client, message: Message):
             reply_markup=InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton("✅ Yes, Save",  callback_data="admin_bw_specific_limit_confirm"),
-                    InlineKeyboardButton("❌ Cancel",      callback_data="admin_bw_specific"),
+                    InlineKeyboardButton("❌ Cancel",      callback_data="admin_bw_this_bot"),
                 ]
             ])
         )
@@ -2335,7 +2238,7 @@ async def bw_specific_limit_confirm_callback(client, cb: CallbackQuery):
         f"**Status:** {'🟢 ON' if enabled else '🔴 OFF (Unlimited)'}\n\n"
         f"The bot will update within **60 seconds** (or instantly if it's this bot).",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⬅️ Back to Bot List", callback_data="admin_bw_specific")],
+            [InlineKeyboardButton("⬅️ Back to This Bot", callback_data="admin_bw_this_bot")],
             [InlineKeyboardButton("🏠 Main Menu",        callback_data="admin_main_menu")],
         ])
     )
