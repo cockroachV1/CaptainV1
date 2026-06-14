@@ -52,10 +52,10 @@ class Config:
     API_HASH         = os.environ.get("API_HASH", "")
     BOT_TOKEN        = os.environ.get("BOT_TOKEN", "")
     ADMIN_IDS        = list(int(x) for x in os.environ.get("ADMIN_IDS", "6644681404").split())
-    PROTECTED_DOMAIN = os.environ.get("PROTECTED_DOMAIN", "https://www.keralacaptain.shop/").rstrip('/') + '/'
+    PROTECTED_DOMAIN = os.environ.get("PROTECTED_DOMAIN", "https://www.keralacaptain.shop/").strip().rstrip('/') + '/'
     MONGO_URI        = os.environ.get("MONGO_URI", "")
     LOG_CHANNEL_ID   = int(os.environ.get("LOG_CHANNEL_ID", 0))
-    STREAM_URL       = os.environ.get("STREAM_URL", "").rstrip('/')
+    STREAM_URL       = os.environ.get("STREAM_URL", "").strip().rstrip('/')
     PORT             = int(os.environ.get("PORT", 8080))
     PING_INTERVAL    = int(os.environ.get("PING_INTERVAL", 1200))
     ON_HEROKU        = 'DYNO' in os.environ
